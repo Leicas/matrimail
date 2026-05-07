@@ -633,3 +633,17 @@ func (eaq *EmailAccountQuery) UpdateLastSync(ctx context.Context, userMXID, emai
 	`, syncTime, userMXID, email)
 	return err
 }
+
+// UpdateMonitoredFolders persists a fresh folder list onto an existing
+// account row without going through INSERT OR REPLACE (which would erase any
+// auth_type / oauth_* columns set on the side via SaveOAuthToken). Used by
+// the OAuth login flow's completeLogin step.
+func (eaq *EmailAccountQuery) UpdateMonitoredFolders(ctx context.Context, userMXID, email string, folders []string) error {
+	tmp := &EmailAccount{MonitoredFolders: folders}
+	_, err := eaq.DB.Exec(ctx, `
+		UPDATE email_accounts
+		SET monitored_folders = ?
+		WHERE user_mxid = ? AND email = ?
+	`, tmp.GetMonitoredFoldersJSON(), userMXID, email)
+	return err
+}

@@ -53,6 +53,15 @@ var (
 	reCSSCidURL = regexp.MustCompile(`(?i)url\(\s*cid:([^) \t\r\n]+)\s*\)`)
 )
 
+// DedupChecker reports whether a given (receiver, messageID) pair was sent by
+// us — i.e. we issued an outbound send for it and the IMAP IDLE just echoed
+// it back from the Sent folder. The connector wires a concrete implementation
+// at startup; the field is nil-tolerant so tests and the legacy single-direction
+// path keep working.
+type DedupChecker interface {
+	IsOurMessage(ctx context.Context, receiver, messageID string) (bool, error)
+}
+
 // Processor handles the complete email processing pipeline
 type Processor struct {
 	log           *zerolog.Logger
@@ -67,7 +76,15 @@ type Processor struct {
 	MaxUploadBytes int
 	// When true, attempt gzip for oversized original email bodies before giving up.
 	GzipLargeBodies bool
+
+	// dedupChecker is consulted on Sent-mailbox messages to suppress our own
+	// outbound echoes. nil means dedup is disabled (legacy / inbound-only mode).
+	dedupChecker DedupChecker
 }
+
+// SetDedupChecker wires a DedupChecker into the processor. Called once at
+// startup from EmailConnector.Init.
+func (p *Processor) SetDedupChecker(d DedupChecker) { p.dedupChecker = d }
 
 // NewProcessor creates a new email processor
 func NewProcessor(log *zerolog.Logger, threadManager *ThreadManager, sanitized bool, secret string) *Processor {
@@ -128,6 +145,30 @@ func (p *Processor) ProcessIMAPMessage(ctx context.Context, fetchData *imapclien
 			Str("subject", parsedEmail.Subject).
 			Str("from", parsedEmail.From).
 			Msg("Successfully parsed email message")
+	}
+
+	// Step 0: Sent-folder dedup. If the IMAP IDLE just echoed back a message
+	// we ourselves sent (recorded by HandleMatrixMessage in the connector),
+	// short-circuit before threading + portal work. Returning (nil, nil)
+	// signals "no error, nothing to forward"; the IMAP caller in
+	// pkg/imap/client.go must (and does, post-Phase B) tolerate that.
+	if p.dedupChecker != nil && p.isOutboundMessage(mailbox) {
+		if hit, derr := p.dedupChecker.IsOurMessage(ctx, string(userLogin.ID), parsedEmail.MessageID); derr != nil {
+			p.log.Warn().Err(derr).Msg("Dedup check failed; falling through and processing message normally")
+		} else if hit {
+			if p.sanitized {
+				p.log.Debug().
+					Str("message_id_hash", logging.HashHMAC(parsedEmail.MessageID, p.secret, 10)).
+					Str("mailbox", mailbox).
+					Msg("Skipping our own outbound message (Sent-folder dedup)")
+			} else {
+				p.log.Debug().
+					Str("message_id", parsedEmail.MessageID).
+					Str("mailbox", mailbox).
+					Msg("Skipping our own outbound message (Sent-folder dedup)")
+			}
+			return nil, nil
+		}
 	}
 
 	// Step 1: Determine thread membership (scoped by receiver)

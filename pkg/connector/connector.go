@@ -28,6 +28,16 @@ type EmailConnector struct {
 	ThreadManager *email.ThreadManager
 	Processor     *email.Processor
 	DB            *EmailAccountQuery
+
+	// SentDedup records the messages we ourselves sent, keyed by Message-ID,
+	// so the inbound IMAP processor can suppress the IDLE echo from the Sent
+	// folder. Populated in Init; the sender (Phase C) will call Record from
+	// HandleMatrixMessage.
+	SentDedup *SentDedupQuery
+
+	// initCancel cancels the long-lived context used for the dedup cleanup
+	// goroutine. Set in Init, called from Stop.
+	initCancel context.CancelFunc
 }
 
 var (
@@ -150,6 +160,49 @@ func (ec *EmailConnector) Init(bridge *bridgev2.Bridge) {
 	ec.Processor.GzipLargeBodies = ec.Config.Processing.GzipLargeBodies
 	ec.IMAPManager.SetProcessor(ec.Processor)
 
+	// Phase B: Sent-folder dedup. Schema first, then wire the checker into
+	// the inbound processor. The bridge_id is the BeeperBridgeType so that a
+	// shared DB across multiple bridge instances stays scoped per-bridge.
+	ec.SentDedup = &SentDedupQuery{
+		DB:       bridge.DB,
+		BridgeID: ec.GetName().BeeperBridgeType,
+	}
+	if err := ec.SentDedup.CreateTable(ctx); err != nil {
+		bridge.Log.Error().Err(err).Msg("Failed to create matrimail_sent_dedup table")
+		panic(fmt.Errorf("sent dedup table init failed: %w", err))
+	}
+	ec.Processor.SetDedupChecker(&dedupAdapter{store: ec.SentDedup})
+
+	// Background cleanup goroutine: prune entries older than 30 days, every
+	// 24h. The IMAP echo of an outbound send arrives within seconds, so
+	// 30 days is more than enough headroom for slow Sent folders or
+	// backfills. Cancellation is wired through ec.initCancel (called from Stop).
+	cleanupCtx, cancel := context.WithCancel(context.Background())
+	ec.initCancel = cancel
+	go func() {
+		// Run an initial cleanup at startup so the table doesn't bloat
+		// indefinitely if the bridge is restarted frequently.
+		if n, cerr := ec.SentDedup.Cleanup(cleanupCtx, time.Now().Add(-30*24*time.Hour)); cerr != nil {
+			bridge.Log.Warn().Err(cerr).Msg("sent_dedup startup cleanup failed")
+		} else if n > 0 {
+			bridge.Log.Info().Int64("rows", n).Msg("sent_dedup startup cleanup deleted old entries")
+		}
+		ticker := time.NewTicker(24 * time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-cleanupCtx.Done():
+				return
+			case <-ticker.C:
+				if n, cerr := ec.SentDedup.Cleanup(cleanupCtx, time.Now().Add(-30*24*time.Hour)); cerr != nil {
+					bridge.Log.Warn().Err(cerr).Msg("sent_dedup periodic cleanup failed")
+				} else if n > 0 {
+					bridge.Log.Debug().Int64("rows", n).Msg("sent_dedup periodic cleanup")
+				}
+			}
+		}
+	}()
+
 	// Add commands with connector context
 	ec.Bridge.Commands.(*commands.Processor).AddHandlers(
 		ec.createCommands()...,
@@ -256,7 +309,31 @@ func (ec *EmailConnector) Stop() {
 		ec.IMAPManager.StopAll()
 	}
 
+	// Cancel the dedup cleanup goroutine.
+	if ec.initCancel != nil {
+		ec.initCancel()
+	}
+
 	ec.Bridge.Log.Info().Msg("Email connector stopped")
+}
+
+// dedupAdapter is the connector-side glue that exposes SentDedupQuery.Exists
+// as the email.DedupChecker interface. Lives in this file (vs. a separate
+// shim file) because the type is too small to deserve its own and inverting
+// the import direction (email package importing connector) would create a
+// cycle.
+type dedupAdapter struct {
+	store *SentDedupQuery
+}
+
+// IsOurMessage reports whether the given Message-ID was previously recorded
+// by the outbound sender for this receiver. Returns (false, nil) when the
+// store is nil so a half-initialized connector still serves inbound traffic.
+func (d *dedupAdapter) IsOurMessage(ctx context.Context, receiver, messageID string) (bool, error) {
+	if d == nil || d.store == nil {
+		return false, nil
+	}
+	return d.store.Exists(ctx, receiver, messageID)
 }
 
 // LoadUserLogin is now implemented in client.go
@@ -326,7 +403,18 @@ func (ec *EmailConnector) GetChatInfo(ctx context.Context, portal *bridgev2.Port
 
 // Required methods for NetworkConnector interface
 func (ec *EmailConnector) CreateLogin(ctx context.Context, user *bridgev2.User, flowID string) (bridgev2.LoginProcess, error) {
-	return &EmailLoginProcess{user: user, connector: ec}, nil
+	if flowID == "" {
+		flowID = LoginFlowIDPassword
+	}
+	if flowID == LoginFlowIDOAuthGmail {
+		// Reject early when the bridge has no Gmail OAuth credentials
+		// configured — better than letting the flow start and fail at
+		// DeviceCodeStart.
+		if ec.Config.GmailOAuth.ClientID == "" || ec.Config.GmailOAuth.ClientSecret == "" {
+			return nil, fmt.Errorf("gmail_oauth not configured on this bridge; ask your admin to set client_id/client_secret in config or use the email-password flow")
+		}
+	}
+	return &EmailLoginProcess{user: user, connector: ec, flowID: flowID}, nil
 }
 
 func (ec *EmailConnector) GetDBMetaTables() []any {
@@ -345,11 +433,22 @@ func (ec *EmailConnector) GetBridgeInfoVersion() (int, int) {
 }
 
 func (ec *EmailConnector) GetLoginFlows() []bridgev2.LoginFlow {
-	return []bridgev2.LoginFlow{{
-		Name:        "email-password",
-		Description: "Email and password login",
-		ID:          "email-password",
+	flows := []bridgev2.LoginFlow{{
+		Name:        "Email + App Password",
+		Description: "IMAP login with an email address and an app password (Gmail, Outlook, iCloud, FastMail, custom IMAP, etc.)",
+		ID:          LoginFlowIDPassword,
 	}}
+	// Only advertise the Gmail OAuth flow if the bridge admin has configured
+	// the Desktop client credentials. Otherwise Beeper would offer a flow
+	// that immediately errors in CreateLogin.
+	if ec.Config.GmailOAuth.ClientID != "" && ec.Config.GmailOAuth.ClientSecret != "" {
+		flows = append(flows, bridgev2.LoginFlow{
+			Name:        "Gmail (OAuth, recommended)",
+			Description: "Sign in to your Google account via the device-code flow. No app password required; uses XOAUTH2 for IMAP and the Gmail API for sending.",
+			ID:          LoginFlowIDOAuthGmail,
+		})
+	}
+	return flows
 }
 
 // Helper functions for creating network IDs

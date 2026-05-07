@@ -64,6 +64,31 @@ func (w *IMAPDebugWriter) Write(p []byte) (n int, err error) {
 	return len(p), nil
 }
 
+// xoauth2SASL is a tiny sasl.Client implementation that emits the standard
+// Gmail / Microsoft XOAUTH2 payload:
+//
+//	"user=" + email + "\x01auth=Bearer " + token + "\x01\x01"
+//
+// The go-sasl library bundled with go-imap doesn't ship an XOAUTH2 helper at
+// the version we pin, so we wire one up directly. See
+// https://developers.google.com/gmail/imap/xoauth2-protocol#imap_protocol_exchange.
+type xoauth2SASL struct{ user, token string }
+
+func newXoauth2SASL(user, token string) *xoauth2SASL { return &xoauth2SASL{user, token} }
+
+// Start returns the SASL mechanism name and the initial response payload. We
+// always have an initial response because XOAUTH2 is a one-shot mechanism.
+func (x *xoauth2SASL) Start() (mech string, ir []byte, err error) {
+	payload := []byte("user=" + x.user + "\x01auth=Bearer " + x.token + "\x01\x01")
+	return "XOAUTH2", payload, nil
+}
+
+// Next handles continuation challenges. For XOAUTH2 the only legitimate
+// continuation indicates an authentication failure where the server wants to
+// echo back a structured error; sending an empty response is the standard
+// behavior (matches Cyrus SASL's reference XOAUTH2 client).
+func (x *xoauth2SASL) Next(_ []byte) ([]byte, error) { return nil, nil }
+
 // containsCredentials checks if the IMAP data contains authentication credentials
 func (w *IMAPDebugWriter) containsCredentials(data string) bool {
 	dataUpper := strings.ToUpper(data)
@@ -111,6 +136,15 @@ type Client struct {
 	Username string
 	Password string
 	TLS      bool
+
+	// OAuth (XOAUTH2) settings — populated by NewClientOAuth and consulted on
+	// every (re)connect. If TokenProvider is non-nil it is preferred over a
+	// static AccessToken (the provider is expected to call into oauth2.TokenSource
+	// to mint a fresh access token before each connect, so token expiry is
+	// handled by Connect()-driven reconnects).
+	UseXOAUTH2    bool
+	AccessToken   string
+	TokenProvider func(context.Context) (string, error) // optional
 
 	// Logging/sanitization
 	sanitized bool
@@ -308,6 +342,32 @@ func getSecureTLSConfig(serverName string) *tls.Config {
 	}
 }
 
+// NewClientOAuth constructs a Client that authenticates against IMAP using
+// SASL XOAUTH2. accessToken is used for the initial connect; pass nil for
+// tokenProvider to keep using the same static token (lifetime ~1h, after
+// which reconnects will fail with AUTH errors and the caller should
+// reconstruct the client). When tokenProvider is non-nil it is invoked on
+// every (re)connect, so a refresh-aware oauth2.TokenSource keeps the access
+// token fresh transparently.
+func NewClientOAuth(email, username, accessToken string, login *bridgev2.UserLogin, log *zerolog.Logger, sanitized bool, secret string, backfillSeconds int, backfillMax int, initialIdleTimeoutSeconds int, stateCoord StateCoordinator) (*Client, error) {
+	c, err := NewClient(email, username, "", login, log, sanitized, secret, backfillSeconds, backfillMax, initialIdleTimeoutSeconds, stateCoord)
+	if err != nil {
+		return nil, err
+	}
+	c.UseXOAUTH2 = true
+	c.AccessToken = accessToken
+	return c, nil
+}
+
+// SetTokenProvider installs a refresh-aware token provider on an OAuth client.
+// The provider is called once per (re)connect to mint a fresh access token,
+// which makes IMAP IDLE robust against the ~1h Google access-token expiry
+// without us having to track it manually.
+func (c *Client) SetTokenProvider(p func(ctx context.Context) (string, error)) {
+	c.TokenProvider = p
+	c.UseXOAUTH2 = true
+}
+
 // NewClient creates a new IMAP client for the given email account
 func NewClient(email, username, password string, login *bridgev2.UserLogin, log *zerolog.Logger, sanitized bool, secret string, backfillSeconds int, backfillMax int, initialIdleTimeoutSeconds int, stateCoord StateCoordinator) (*Client, error) {
 	// Auto-detect provider settings
@@ -497,6 +557,53 @@ func (c *Client) connectInternal() error {
 	// Authenticate with timeout and proper cleanup
 	loginCtx, loginCancel := context.WithTimeout(c.ctx, c.timeoutConfig.Command)
 	defer loginCancel()
+
+	// XOAUTH2 path: refresh the access token (if a TokenProvider was wired)
+	// and AUTHENTICATE with SASL XOAUTH2. The Authenticate method blocks
+	// until the SASL exchange completes, so wrap it in the same goroutine
+	// pattern as Login below for context cancellation.
+	if c.UseXOAUTH2 {
+		token := c.AccessToken
+		if c.TokenProvider != nil {
+			fresh, terr := c.TokenProvider(loginCtx)
+			if terr != nil {
+				conn.Close()
+				return fmt.Errorf("oauth token refresh: %w", terr)
+			}
+			if fresh != "" {
+				token = fresh
+				c.AccessToken = fresh
+			}
+		}
+		if token == "" {
+			conn.Close()
+			return errors.New("xoauth2: empty access token")
+		}
+		authCh := make(chan error, 1)
+		go func() {
+			defer common.RecoverToError(authCh)
+			authCh <- c.client.Authenticate(newXoauth2SASL(c.Username, token))
+		}()
+		select {
+		case err := <-authCh:
+			if err != nil {
+				conn.Close()
+				if errors.Is(err, context.DeadlineExceeded) {
+					return fmt.Errorf("IMAP XOAUTH2 timed out after %v", c.timeoutConfig.Command)
+				}
+				return fmt.Errorf("IMAP XOAUTH2 failed: %w", err)
+			}
+		case <-loginCtx.Done():
+			conn.Close()
+			return fmt.Errorf("IMAP XOAUTH2 context cancelled: %v", loginCtx.Err())
+		}
+		c.connected = true
+		c.log.Info().Msg("Successfully connected to IMAP server (XOAUTH2)")
+		if c.stateCoordinator != nil {
+			c.stateCoordinator.ReportSimpleEvent("inbox", string(coordinator.EventConnectionEstablished), true, "", nil)
+		}
+		return nil
+	}
 
 	loginErr := make(chan error, 1)
 	go func() {
@@ -1271,6 +1378,15 @@ func (c *Client) processMessageWith(ctx context.Context, cli *imapclient.Client,
 			}
 		}
 
+		// Phase B: ProcessIMAPMessage may legitimately return (nil, nil) when
+		// the message was suppressed by Sent-folder dedup (i.e. the bridge
+		// itself sent it; IMAP just echoed it back). Skip the rest of the
+		// portal/event plumbing in that case.
+		if emailMessage == nil {
+			c.log.Debug().Uint32("uid", uint32(uid)).Str("mailbox", mailbox).Msg("Processor returned nil message (dedup); skipping")
+			continue
+		}
+
 		// Convert to Matrix event and queue it
 		matrixEvent := c.processor.ToMatrixEvent(ctx, emailMessage, c.login)
 
@@ -1683,7 +1799,30 @@ func (c *Client) ensureSentConnectionAndLoop() {
 			return nil, err
 		}
 		cli := imapclient.New(conn, &imapclient.Options{DebugWriter: &IMAPDebugWriter{logger: c.log, sanitized: c.sanitized}})
-		if err := cli.Login(c.Username, c.Password).Wait(); err != nil {
+		if c.UseXOAUTH2 {
+			token := c.AccessToken
+			if c.TokenProvider != nil {
+				ctx, cancel := context.WithTimeout(c.ctx, c.timeoutConfig.Command)
+				fresh, terr := c.TokenProvider(ctx)
+				cancel()
+				if terr != nil {
+					conn.Close()
+					return nil, fmt.Errorf("oauth token refresh (sent): %w", terr)
+				}
+				if fresh != "" {
+					token = fresh
+					c.AccessToken = fresh
+				}
+			}
+			if token == "" {
+				conn.Close()
+				return nil, errors.New("xoauth2 (sent): empty access token")
+			}
+			if err := cli.Authenticate(newXoauth2SASL(c.Username, token)); err != nil {
+				conn.Close()
+				return nil, err
+			}
+		} else if err := cli.Login(c.Username, c.Password).Wait(); err != nil {
 			conn.Close()
 			return nil, err
 		}

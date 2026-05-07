@@ -14,6 +14,7 @@ import (
 	"maunium.net/go/mautrix/event"
 
 	"github.com/Leicas/matrimail/pkg/coordinator"
+	"github.com/Leicas/matrimail/pkg/email"
 	"github.com/Leicas/matrimail/pkg/imap"
 	"github.com/Leicas/matrimail/pkg/reliability"
 )
@@ -135,9 +136,74 @@ func (ec *EmailConnector) loadAccountCredentials(ctx context.Context, userMXID, 
 	return account, nil
 }
 
-// createIMAPClient creates and configures the IMAP client
+// createIMAPClient creates and configures the IMAP client.
+//
+// When the account's saved auth_type is "oauth-gmail" we build an OAuth
+// client and wire a refresh-aware TokenProvider so each (re)connect mints a
+// fresh access token via the saved refresh token. This is the simpler of the
+// two refresh strategies: tokens expire ~1h, but IMAP reconnects already
+// happen on errors (and any IDLE drop triggers one), so we just refresh on
+// every reconnect rather than tracking expiry separately.
 func (ec *EmailConnector) createIMAPClient(emailClient *EmailClient, login *bridgev2.UserLogin) error {
 	logger := login.Log.With().Str("component", "imap").Logger()
+
+	// Detect OAuth account (auth_type column from Phase A).
+	provider, tok, err := ec.DB.LoadOAuthToken(context.Background(), login.UserMXID.String(), emailClient.Email)
+	if err != nil {
+		ec.Bridge.Log.Warn().Err(err).Msg("LoadOAuthToken failed; falling back to password auth")
+	}
+	if provider != "" && tok != nil {
+		oauthCfg := email.GmailOAuthConfig{
+			ClientID:     ec.Config.GmailOAuth.ClientID,
+			ClientSecret: ec.Config.GmailOAuth.ClientSecret,
+		}
+		if oauthCfg.ClientID == "" || oauthCfg.ClientSecret == "" {
+			return fmt.Errorf("account %s is OAuth but bridge has no gmail_oauth config", emailClient.Email)
+		}
+		// Use a long-lived background context for the TokenSource so token
+		// refreshes survive any per-request context cancellation.
+		ts := email.TokenSource(context.Background(), oauthCfg, tok)
+
+		imapClient, ierr := imap.NewClientOAuth(
+			emailClient.Email,
+			emailClient.Username,
+			tok.AccessToken,
+			login,
+			&logger,
+			ec.Config.Logging.Sanitized,
+			ec.Config.Logging.PseudonymSecret,
+			ec.Config.Network.IMAP.StartupBackfillSeconds,
+			ec.Config.Network.IMAP.StartupBackfillMax,
+			ec.Config.Network.IMAP.InitialIdleTimeoutSeconds,
+			emailClient.stateCoordinator,
+		)
+		if ierr != nil {
+			return fmt.Errorf("failed to create OAuth IMAP client: %w", ierr)
+		}
+		// Refresh-on-reconnect provider. Persist new tokens whenever the
+		// underlying TokenSource hands us back a freshly minted one so a
+		// bridge restart doesn't lose the latest access token.
+		userMXID := login.UserMXID.String()
+		emailAddr := emailClient.Email
+		imapClient.SetTokenProvider(func(ctx context.Context) (string, error) {
+			fresh, terr := ts.Token()
+			if terr != nil {
+				return "", terr
+			}
+			// Best-effort persistence. Failures are non-fatal — the in-memory
+			// TokenSource still has the new token for subsequent reconnects.
+			if err := ec.DB.SaveOAuthToken(ctx, userMXID, emailAddr, provider, fresh); err != nil {
+				ec.Bridge.Log.Warn().Err(err).Msg("Failed to persist refreshed OAuth token")
+			}
+			return fresh.AccessToken, nil
+		})
+		emailClient.IMAPClient = imapClient
+		if ec.Processor != nil {
+			emailClient.IMAPClient.SetProcessor(ec.Processor)
+		}
+		return nil
+	}
+
 	imapClient, err := imap.NewClient(
 		emailClient.Email,
 		emailClient.Username,
