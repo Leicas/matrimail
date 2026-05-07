@@ -61,7 +61,13 @@ jobs:
         id: semantic
         uses: cycjimmy/semantic-release-action@v4
         with:
+          # release-notes-generator@13 pulls conventional-changelog-writer@7,
+          # which doesn't have the Date-toString-via-Proxy bug that v14's
+          # conventional-changelog-writer@8 hits. Tracked at:
+          # https://github.com/conventional-changelog/conventional-changelog/issues
+          # If you bump this, smoke-test a release run before merging.
           extra_plugins: |
+            @semantic-release/release-notes-generator@13
             @semantic-release/changelog@6
             @semantic-release/git@10
             conventional-changelog-conventionalcommits@7
