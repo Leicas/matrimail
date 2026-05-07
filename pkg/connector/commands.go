@@ -230,13 +230,141 @@ func fnLogin(ce *commands.Event, connector *EmailConnector) {
 		return
 	}
 
-	// Send the login instructions to the user. Only append the app-password
-	// help block when we're actually on the password flow — for OAuth, the
-	// step's own Instructions ARE the right prompt (URL + user code).
-	if flowID == LoginFlowIDPassword {
-		ce.Reply(buildEnhancedLoginInstructions(step.Instructions))
-	} else {
-		ce.Reply(step.Instructions)
+	// Dispatch the first step. For UserInput steps, this also registers a
+	// CommandState that captures the user's NEXT message as input — without
+	// it, the bot's command processor treats the email/password reply as
+	// "Unknown command" and the multi-step login dies after step 1.
+	dispatchLoginStep(ce, loginProcess, step, flowID)
+}
+
+// dispatchLoginStep replicates bridgev2/commands/login.go's unexported
+// doLoginStep so the matrimail login flow can plug into the framework's
+// per-user CommandState routing. Without this, the user's reply to a
+// LoginStepTypeUserInput prompt gets handled by the top-level command
+// processor (which doesn't know about the in-flight login) and the bot
+// replies "Unknown command, use the help command for help."
+//
+// Recursive: each step's submit handler calls back here for the next step.
+func dispatchLoginStep(ce *commands.Event, lp bridgev2.LoginProcess, step *bridgev2.LoginStep, flowID string) {
+	if step.Instructions != "" {
+		// On the first prompt of the password flow, also append our
+		// app-password help block (Gmail/Yahoo/iCloud setup tips). For OAuth
+		// the step's own Instructions are sufficient.
+		if flowID == LoginFlowIDPassword && step.Type == bridgev2.LoginStepTypeUserInput {
+			ce.Reply(buildEnhancedLoginInstructions(step.Instructions))
+		} else {
+			ce.Reply(step.Instructions)
+		}
+	}
+
+	switch step.Type {
+	case bridgev2.LoginStepTypeUserInput:
+		uip, ok := lp.(bridgev2.LoginProcessUserInput)
+		if !ok {
+			ce.Reply("❌ login flow returned a UserInput step but the login process doesn't implement LoginProcessUserInput")
+			return
+		}
+		fields := step.UserInputParams.Fields
+		data := make(map[string]string, len(fields))
+		var prompt func(remaining []bridgev2.LoginInputDataField)
+		prompt = func(remaining []bridgev2.LoginInputDataField) {
+			if len(remaining) == 0 {
+				next, err := uip.SubmitUserInput(ce.Ctx, data)
+				if err != nil {
+					ce.Reply("❌ Failed to submit input: %v", err)
+					return
+				}
+				commands.StoreCommandState(ce.User, nil)
+				dispatchLoginStep(ce, lp, next, flowID)
+				return
+			}
+			field := remaining[0]
+			if field.Description != "" {
+				ce.Reply("Please enter your %s\n%s", field.Name, field.Description)
+			} else {
+				ce.Reply("Please enter your %s", field.Name)
+			}
+			commands.StoreCommandState(ce.User, &commands.CommandState{
+				Action: "Login",
+				Next: commands.MinimalCommandHandlerFunc(func(ce *commands.Event) {
+					field.FillDefaultValidate()
+					if field.Type == bridgev2.LoginInputFieldTypePassword || field.Type == bridgev2.LoginInputFieldTypeToken {
+						ce.Redact()
+					}
+					val, err := field.Validate(ce.RawArgs)
+					if err != nil {
+						ce.Reply("❌ Invalid value for %s: %v", field.Name, err)
+						prompt(remaining)
+						return
+					}
+					data[field.ID] = val
+					prompt(remaining[1:])
+				}),
+				Cancel: func() {
+					_, _ = uip.Cancel, uip // intentional: Cancel signature varies; rely on framework cleanup
+				},
+			})
+		}
+		// First field: collect immediately. The step's own Instructions
+		// (already sent above) act as the "ask"; we only need promptNext to
+		// register the CommandState.Next handler.
+		commands.StoreCommandState(ce.User, &commands.CommandState{
+			Action: "Login",
+			Next: commands.MinimalCommandHandlerFunc(func(ce *commands.Event) {
+				field := fields[0]
+				field.FillDefaultValidate()
+				if field.Type == bridgev2.LoginInputFieldTypePassword || field.Type == bridgev2.LoginInputFieldTypeToken {
+					ce.Redact()
+				}
+				val, err := field.Validate(ce.RawArgs)
+				if err != nil {
+					ce.Reply("❌ Invalid value for %s: %v", field.Name, err)
+					return
+				}
+				data[field.ID] = val
+				if len(fields) > 1 {
+					prompt(fields[1:])
+					return
+				}
+				next, err := uip.SubmitUserInput(ce.Ctx, data)
+				if err != nil {
+					ce.Reply("❌ Failed to submit input: %v", err)
+					return
+				}
+				commands.StoreCommandState(ce.User, nil)
+				dispatchLoginStep(ce, lp, next, flowID)
+			}),
+		})
+
+	case bridgev2.LoginStepTypeDisplayAndWait:
+		daw, ok := lp.(bridgev2.LoginProcessDisplayAndWait)
+		if !ok {
+			ce.Reply("❌ login flow returned a DisplayAndWait step but the login process doesn't implement LoginProcessDisplayAndWait")
+			return
+		}
+		ctx, cancel := context.WithCancel(ce.Ctx)
+		commands.StoreCommandState(ce.User, &commands.CommandState{
+			Action: "Login",
+			Cancel: cancel,
+		})
+		go func() {
+			defer cancel()
+			next, err := daw.Wait(ctx)
+			commands.StoreCommandState(ce.User, nil)
+			if err != nil {
+				ce.Reply("❌ Login wait failed: %v", err)
+				return
+			}
+			dispatchLoginStep(ce, lp, next, flowID)
+		}()
+
+	case bridgev2.LoginStepTypeComplete:
+		commands.StoreCommandState(ce.User, nil)
+		// Framework already records the new login; just confirm.
+		ce.Reply("✅ Login complete.")
+
+	default:
+		ce.Reply("❌ Unknown login step type: %s", step.Type)
 	}
 }
 
