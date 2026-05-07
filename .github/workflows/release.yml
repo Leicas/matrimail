@@ -114,6 +114,16 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Docker requires lowercase image names. ${{ github.repository }}
+      # preserves the repo's actual case (Leicas/matrimail), so we have to
+      # lowercase it here before passing to the build action.
+      - name: Lowercase image name
+        if: steps.semantic.outputs.new_release_published == 'true'
+        id: lc
+        run: echo "image=${IMAGE_NAME,,}" >> "$GITHUB_OUTPUT"
+        env:
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+
       - name: Build & push versioned image
         if: steps.semantic.outputs.new_release_published == 'true'
         uses: docker/build-push-action@v6
@@ -125,9 +135,9 @@ jobs:
           # Three tags per release: the exact version, the major.minor (so
           # downstream pinning is easier), and `latest`.
           tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.semantic.outputs.new_release_version }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.semantic.outputs.new_release_major_version }}.${{ steps.semantic.outputs.new_release_minor_version }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            ${{ env.REGISTRY }}/${{ steps.lc.outputs.image }}:${{ steps.semantic.outputs.new_release_version }}
+            ${{ env.REGISTRY }}/${{ steps.lc.outputs.image }}:${{ steps.semantic.outputs.new_release_major_version }}.${{ steps.semantic.outputs.new_release_minor_version }}
+            ${{ env.REGISTRY }}/${{ steps.lc.outputs.image }}:latest
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.version=${{ steps.semantic.outputs.new_release_version }}
