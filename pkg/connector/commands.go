@@ -215,6 +215,7 @@ func fnLogin(ce *commands.Event, connector *EmailConnector) {
 	// If Gmail OAuth is configured at the bridge level, offer a choice;
 	// otherwise stay on the historical app-password flow.
 	flowID := pickInteractiveLoginFlow(connector)
+	connector.Bridge.Log.Info().Str("flow_id", flowID).Msg("matrimail: starting interactive login flow")
 
 	loginProcess, err := connector.CreateLogin(ctx, ce.User, flowID)
 	if err != nil {
@@ -229,8 +230,14 @@ func fnLogin(ce *commands.Event, connector *EmailConnector) {
 		return
 	}
 
-	// Send the updated login instructions to the user
-	ce.Reply(buildEnhancedLoginInstructions(step.Instructions))
+	// Send the login instructions to the user. Only append the app-password
+	// help block when we're actually on the password flow — for OAuth, the
+	// step's own Instructions ARE the right prompt (URL + user code).
+	if flowID == LoginFlowIDPassword {
+		ce.Reply(buildEnhancedLoginInstructions(step.Instructions))
+	} else {
+		ce.Reply(step.Instructions)
+	}
 }
 
 // pickInteractiveLoginFlow returns LoginFlowIDOAuthGmail when the bridge is
