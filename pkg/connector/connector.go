@@ -68,20 +68,37 @@ func (ec *EmailConnector) Init(bridge *bridgev2.Bridge) {
 		InitialIdleTimeoutSeconds: 3,
 	}
 
-	ec.Config = Config{
-		IMAP: imapConfig,
-		Network: NetworkConfig{
-			IMAP: imapConfig, // Keep Network.IMAP populated for backward compatibility
-		},
-		Logging: LoggingConfig{
-			Sanitized:       true,
-			PseudonymSecret: "",
-		},
-		Processing: ProcessingConfig{
-			MaxUploadBytes:  DefaultMaxUploadBytes,
-			GzipLargeBodies: true,
-		},
+	// CRITICAL: do NOT do `ec.Config = Config{...}` here — that wipes whatever
+	// the framework's LoadConfig decoded out of the user's network: block in
+	// config.yaml (including GmailOAuth.{ClientID,ClientSecret}, which would
+	// break the OAuth login flow picker).
+	//
+	// Instead, fill in zero-value defaults only for fields the user didn't set.
+	// The example-config.yaml already documents the defaults; this is a safety
+	// net for old configs that predate a field's introduction.
+	if ec.Config.IMAP.DefaultTimeout == 0 {
+		ec.Config.IMAP.DefaultTimeout = imapConfig.DefaultTimeout
 	}
+	if ec.Config.IMAP.StartupBackfillSeconds == 0 {
+		ec.Config.IMAP.StartupBackfillSeconds = imapConfig.StartupBackfillSeconds
+	}
+	if ec.Config.IMAP.StartupBackfillMax == 0 {
+		ec.Config.IMAP.StartupBackfillMax = imapConfig.StartupBackfillMax
+	}
+	if ec.Config.IMAP.InitialIdleTimeoutSeconds == 0 {
+		ec.Config.IMAP.InitialIdleTimeoutSeconds = imapConfig.InitialIdleTimeoutSeconds
+	}
+	// Keep Network.IMAP populated for backward compatibility (some legacy paths
+	// read from ec.Config.Network.IMAP rather than ec.Config.IMAP).
+	if ec.Config.Network.IMAP.DefaultTimeout == 0 {
+		ec.Config.Network.IMAP = ec.Config.IMAP
+	}
+	if ec.Config.Processing.MaxUploadBytes == 0 {
+		ec.Config.Processing.MaxUploadBytes = DefaultMaxUploadBytes
+	}
+	// Logging.Sanitized defaults to true; can't distinguish "user set false"
+	// from "zero value", so we trust whatever was decoded. Old configs without
+	// the field present will get zero (false) — acceptable behavior change.
 
 	// Allow environment overrides for verbose logging
 	// MATRIMAIL_LOG_LEVEL: trace|debug|info|warn|error
