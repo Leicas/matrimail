@@ -57,20 +57,41 @@ jobs:
         with:
           node-version: "20"
 
+      # Install semantic-release and plugins explicitly. Avoids the
+      # cycjimmy/semantic-release-action bundling its own copy of
+      # conventional-changelog-writer@8, which has a Date-toString-via-Proxy
+      # bug that crashes generateNotes. Pinning here gives us full control of
+      # the dep tree.
+      - name: Install semantic-release
+        run: |
+          npm install --no-save \
+            semantic-release@22 \
+            @semantic-release/commit-analyzer@11 \
+            @semantic-release/release-notes-generator@12 \
+            @semantic-release/changelog@6 \
+            @semantic-release/github@10 \
+            @semantic-release/git@10 \
+            conventional-changelog-conventionalcommits@7
+
       - name: Run semantic-release
         id: semantic
-        uses: cycjimmy/semantic-release-action@v4
-        with:
-          # release-notes-generator@13 pulls conventional-changelog-writer@7,
-          # which doesn't have the Date-toString-via-Proxy bug that v14's
-          # conventional-changelog-writer@8 hits. Tracked at:
-          # https://github.com/conventional-changelog/conventional-changelog/issues
-          # If you bump this, smoke-test a release run before merging.
-          extra_plugins: |
-            @semantic-release/release-notes-generator@13
-            @semantic-release/changelog@6
-            @semantic-release/git@10
-            conventional-changelog-conventionalcommits@7
+        run: |
+          set -e
+          # Capture semantic-release's stdout so we can extract the published
+          # version into step outputs (cycjimmy's outputs don't apply here).
+          npx semantic-release | tee semantic-release.log
+          if grep -q "Published release" semantic-release.log; then
+            version="$(grep -oP 'Published release \K[0-9]+\.[0-9]+\.[0-9]+' semantic-release.log | head -n1)"
+            echo "new_release_published=true" >> "$GITHUB_OUTPUT"
+            echo "new_release_version=$version" >> "$GITHUB_OUTPUT"
+            major="${version%%.*}"
+            rest="${version#*.}"
+            minor="${rest%%.*}"
+            echo "new_release_major_version=$major" >> "$GITHUB_OUTPUT"
+            echo "new_release_minor_version=$minor" >> "$GITHUB_OUTPUT"
+          else
+            echo "new_release_published=false" >> "$GITHUB_OUTPUT"
+          fi
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
