@@ -1,8 +1,10 @@
 name: Docker
 
-# Builds the matrimail container image on:
-#   - pushes to main / feat-* (so feature branches get a publishable image)
-#   - tag pushes (v*.*.* → versioned image + :latest)
+# Builds the matrimail container image for branch + PR builds. Versioned
+# release builds (vX.Y.Z) are owned by .github/workflows/release.yml — that
+# workflow runs semantic-release on main and inline-builds the versioned
+# image. We keep this workflow for:
+#   - pushes to main / feat-* (sha-tagged + branch-tagged images for testing)
 #   - manual dispatch (operator can re-cut from any ref)
 #   - PRs (build only, no push — sanity-check that the Dockerfile still builds)
 #
@@ -18,8 +20,6 @@ on:
     branches:
       - main
       - "feat/**"
-    tags:
-      - "v*.*.*"
   pull_request:
     branches:
       - main
@@ -60,9 +60,9 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Tagging strategy:
+      # Tagging strategy (release.yml handles semver tags for versioned releases):
       #   - branch builds → ghcr.io/.../matrimail:<branch>
-      #   - tag builds    → ghcr.io/.../matrimail:<version>  +  :latest
+      #   - PRs           → ghcr.io/.../matrimail:pr-<number>  (build-only, not pushed)
       #   - any commit    → ghcr.io/.../matrimail:sha-<short-sha>
       # docker/metadata-action handles slash-sanitization (feat/foo → feat-foo).
       - name: Extract image metadata
@@ -73,10 +73,7 @@ jobs:
           tags: |
             type=ref,event=branch
             type=ref,event=pr
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
             type=sha,prefix=sha-,format=short
-            type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build and push
         uses: docker/build-push-action@v6

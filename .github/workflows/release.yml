@@ -1,0 +1,109 @@
+name: Release
+
+# Runs semantic-release on every push to main, which:
+#   1. Inspects commit messages since the last release (Conventional Commits).
+#   2. Decides the next semantic version (major/minor/patch) or skips if no
+#      release-worthy commits land.
+#   3. Generates a CHANGELOG.md update + a GitHub release with notes.
+#   4. Tags the release commit vX.Y.Z and pushes both the tag and the
+#      changelog commit back to main.
+#
+# When a new release is cut, this same job follows up by building the Docker
+# image with the new version tag and pushing it to GHCR. We do this inline
+# rather than via the existing docker.yml workflow because GitHub's anti-
+# recursion rule: tags created by GITHUB_TOKEN don't trigger downstream
+# `on: push: tags:` workflows. Inline keeps the release atomic.
+#
+# Commit conventions (relevant prefixes for version bumps):
+#   feat:      → minor bump
+#   fix:       → patch bump
+#   perf:      → patch bump
+#   BREAKING CHANGE: in body or `feat!:` / `fix!:` → major bump
+#   chore:, docs:, test:, ci:, refactor:, style:, build: → no release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write       # semantic-release pushes tags + CHANGELOG commits
+  issues: write         # for commenting on resolved issues
+  pull-requests: write  # for commenting on merged PRs
+  packages: write       # for pushing the versioned Docker image
+  id-token: write       # reserved: cosign / OIDC keyless signing
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  release:
+    name: semantic-release + docker
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # semantic-release needs the full history to inspect commit messages.
+          fetch-depth: 0
+          # Don't persist the default credentials — semantic-release will set
+          # its own auth via the GITHUB_TOKEN env var.
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Run semantic-release
+        id: semantic
+        uses: cycjimmy/semantic-release-action@v4
+        with:
+          extra_plugins: |
+            @semantic-release/changelog@6
+            @semantic-release/git@10
+            conventional-changelog-conventionalcommits@7
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # The Docker steps below are gated on a new release actually being
+      # published. No-op commits (chore:, docs:, ci:, etc.) won't bump the
+      # version → no need to rebuild the image.
+      - name: Set up QEMU
+        if: steps.semantic.outputs.new_release_published == 'true'
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        if: steps.semantic.outputs.new_release_published == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: steps.semantic.outputs.new_release_published == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & push versioned image
+        if: steps.semantic.outputs.new_release_published == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          # Three tags per release: the exact version, the major.minor (so
+          # downstream pinning is easier), and `latest`.
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.semantic.outputs.new_release_version }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.semantic.outputs.new_release_major_version }}.${{ steps.semantic.outputs.new_release_minor_version }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.semantic.outputs.new_release_version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
