@@ -1,0 +1,169 @@
+package connector
+
+import (
+	"context"
+	"fmt"
+	"sync"
+
+	"golang.org/x/oauth2"
+	gmail "google.golang.org/api/gmail/v1"
+	"maunium.net/go/mautrix/bridgev2"
+
+	"github.com/Leicas/matrimail/pkg/email"
+)
+
+// GmailInboundManager owns the per-account GmailHistoryPoller lifecycle for
+// scope-mode='modify' accounts. The IMAP path doesn't need this: IMAP IDLE
+// connections are managed by pkg/imap. For Gmail-API mode there's no
+// long-lived TCP connection to drive — we poll users.history.list every
+// PollInterval and feed the results through the same processor pipeline.
+//
+// One manager instance per EmailConnector; one poller per (UserMXID, Email)
+// account pair.
+type GmailInboundManager struct {
+	connector *EmailConnector
+
+	mu      sync.Mutex
+	runners map[string]*gmailRunner // key: UserMXID + "|" + Email
+}
+
+type gmailRunner struct {
+	cancel context.CancelFunc
+	poller *email.GmailHistoryPoller
+}
+
+// NewGmailInboundManager constructs the manager. Wired up from
+// EmailConnector.Init.
+func NewGmailInboundManager(ec *EmailConnector) *GmailInboundManager {
+	return &GmailInboundManager{
+		connector: ec,
+		runners:   map[string]*gmailRunner{},
+	}
+}
+
+// Start spawns a poller for the given login if one doesn't already exist.
+// Idempotent — calling it twice for the same account is a no-op (the second
+// call returns nil).
+//
+// labels are the Gmail label IDs the user picked at login time (the
+// monitored_folders column for modify-mode accounts).
+func (m *GmailInboundManager) Start(ctx context.Context, login *bridgev2.UserLogin, emailAddr string, labels []string, ts oauth2.TokenSource) error {
+	if m == nil {
+		return fmt.Errorf("GmailInboundManager: nil manager")
+	}
+	key := login.UserMXID.String() + "|" + emailAddr
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, exists := m.runners[key]; exists {
+		return nil // already running
+	}
+
+	logger := m.connector.Bridge.Log.With().Str("component", "gmail_inbound").Str("email", emailAddr).Logger()
+	userMXID := login.UserMXID.String()
+
+	poller := &email.GmailHistoryPoller{
+		UserMXID:          userMXID,
+		Email:             emailAddr,
+		MonitoredLabelIDs: labels,
+		TokenSource:       ts,
+		CursorLoad: func(ctx context.Context) (uint64, error) {
+			return m.connector.DB.GetGmailHistoryID(ctx, userMXID, emailAddr)
+		},
+		CursorSave: func(ctx context.Context, historyID uint64) error {
+			return m.connector.DB.SetGmailHistoryID(ctx, userMXID, emailAddr, historyID)
+		},
+		OnMessage: func(ctx context.Context, msg *gmail.Message, mailbox string) error {
+			return m.handleMessage(ctx, login, emailAddr, msg, mailbox)
+		},
+		Log: &logger,
+	}
+
+	runnerCtx, cancel := context.WithCancel(context.Background())
+	m.runners[key] = &gmailRunner{cancel: cancel, poller: poller}
+
+	go func() {
+		if err := poller.Run(runnerCtx); err != nil && runnerCtx.Err() == nil {
+			logger.Error().Err(err).Msg("Gmail history poller exited with error")
+		}
+	}()
+
+	logger.Info().Strs("labels", labels).Msg("Gmail inbound poller started")
+	return nil
+}
+
+// Stop tears down the poller for the given account. Idempotent.
+func (m *GmailInboundManager) Stop(userMXID, emailAddr string) {
+	if m == nil {
+		return
+	}
+	key := userMXID + "|" + emailAddr
+	m.mu.Lock()
+	r := m.runners[key]
+	delete(m.runners, key)
+	m.mu.Unlock()
+	if r != nil {
+		r.cancel()
+		r.poller.Stop()
+	}
+}
+
+// StopAll tears down every registered poller. Called from EmailConnector.Stop.
+func (m *GmailInboundManager) StopAll() {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	runners := m.runners
+	m.runners = map[string]*gmailRunner{}
+	m.mu.Unlock()
+	for _, r := range runners {
+		r.cancel()
+		r.poller.Stop()
+	}
+}
+
+// handleMessage is the OnMessage callback for the poller. Builds a
+// ParsedEmail, runs the processor's shared post-parse pipeline, then queues
+// the resulting Matrix event through the bridgev2 portal/event machinery.
+//
+// Mirrors pkg/imap/client.go's post-process path: portal lookup → portal
+// creation if missing → ensure room → QueueRemoteEvent.
+func (m *GmailInboundManager) handleMessage(ctx context.Context, login *bridgev2.UserLogin, emailAddr string, msg *gmail.Message, mailbox string) error {
+	parsed, err := email.ParseGmailAPIMessage(msg)
+	if err != nil {
+		return fmt.Errorf("parse gmail message %s: %w", msg.Id, err)
+	}
+	emailMsg, err := m.connector.Processor.ProcessParsedEmail(ctx, parsed, login, mailbox)
+	if err != nil {
+		return fmt.Errorf("process parsed email: %w", err)
+	}
+	if emailMsg == nil {
+		// dedup hit — nothing to forward
+		return nil
+	}
+
+	matrixEvent := m.connector.Processor.ToMatrixEvent(ctx, emailMsg, login)
+
+	portal, err := login.Bridge.GetExistingPortalByKey(ctx, emailMsg.PortalKey)
+	if err != nil {
+		return fmt.Errorf("portal lookup: %w", err)
+	}
+	if portal == nil {
+		portal, err = login.Bridge.GetPortalByKey(ctx, emailMsg.PortalKey)
+		if err != nil {
+			return fmt.Errorf("create portal: %w", err)
+		}
+	}
+	if portal.MXID == "" {
+		if err := portal.CreateMatrixRoom(ctx, login, nil); err != nil {
+			return fmt.Errorf("create matrix room: %w", err)
+		}
+	}
+
+	if !login.QueueRemoteEvent(matrixEvent).Success {
+		return fmt.Errorf("queue remote event failed for message %s", emailMsg.MessageID)
+	}
+	return nil
+}
+

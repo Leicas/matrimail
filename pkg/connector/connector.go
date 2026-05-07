@@ -29,6 +29,11 @@ type EmailConnector struct {
 	Processor     *email.Processor
 	DB            *EmailAccountQuery
 
+	// GmailInbound owns Gmail-API-mode inbound pollers, one per modify-mode
+	// account. IMAP-mode (full scope) accounts go through IMAPManager
+	// instead. Populated in Init.
+	GmailInbound *GmailInboundManager
+
 	// SentDedup records the messages we ourselves sent, keyed by Message-ID,
 	// so the inbound IMAP processor can suppress the IDLE echo from the Sent
 	// folder. Populated in Init; the sender (Phase C) will call Record from
@@ -190,6 +195,10 @@ func (ec *EmailConnector) Init(bridge *bridgev2.Bridge) {
 	}
 	ec.Processor.SetDedupChecker(&dedupAdapter{store: ec.SentDedup})
 
+	// Gmail-API inbound pollers — one per modify-mode account, spawned in
+	// LoadUserLogin. The manager itself is just bookkeeping.
+	ec.GmailInbound = NewGmailInboundManager(ec)
+
 	// Background cleanup goroutine: prune entries older than 30 days, every
 	// 24h. The IMAP echo of an outbound send arrives within seconds, so
 	// 30 days is more than enough headroom for slow Sent folders or
@@ -318,6 +327,15 @@ func (ec *EmailConnector) createCommands() []commands.CommandHandler {
 				Args:        `to:<email> [cc:...] [subject:"..."]`,
 			},
 		},
+		&commands.FullHandler{
+			Func: func(ce *commands.Event) { fnOAuth(ce, ec) },
+			Name: "oauth",
+			Help: commands.HelpMeta{
+				Section:     HelpSectionAuth,
+				Description: "Manage OAuth tokens (paste-token / revoke).",
+				Args:        `paste-token <email> <refresh_token> | revoke <email>`,
+			},
+		},
 	}
 }
 
@@ -333,6 +351,11 @@ func (ec *EmailConnector) Stop() {
 	// Stop all IMAP clients
 	if ec.IMAPManager != nil {
 		ec.IMAPManager.StopAll()
+	}
+
+	// Stop all Gmail-API pollers
+	if ec.GmailInbound != nil {
+		ec.GmailInbound.StopAll()
 	}
 
 	// Cancel the dedup cleanup goroutine.
@@ -458,10 +481,10 @@ func (ec *EmailConnector) CreateLogin(ctx context.Context, user *bridgev2.User, 
 	}
 	if flowID == LoginFlowIDOAuthGmail {
 		// Reject early when the bridge has no Gmail OAuth credentials
-		// configured — better than letting the flow start and fail at
-		// DeviceCodeStart.
+		// configured — better than letting the flow start and fail when we
+		// try to spin up the loopback listener.
 		if ec.Config.GmailOAuth.ClientID == "" || ec.Config.GmailOAuth.ClientSecret == "" {
-			return nil, fmt.Errorf("gmail_oauth not configured on this bridge; ask your admin to set client_id/client_secret in config or use the email-password flow")
+			return nil, fmt.Errorf("gmail_oauth not configured on this bridge; see docs/gmail-oauth-setup.md, or use the email-password flow")
 		}
 	}
 	return &EmailLoginProcess{user: user, connector: ec, flowID: flowID}, nil
@@ -499,7 +522,7 @@ func (ec *EmailConnector) GetLoginFlows() []bridgev2.LoginFlow {
 	if ec.Config.GmailOAuth.ClientID != "" && ec.Config.GmailOAuth.ClientSecret != "" {
 		flows = append(flows, bridgev2.LoginFlow{
 			Name:        "Gmail (OAuth, recommended)",
-			Description: "Sign in to your Google account via the device-code flow. No app password required; uses XOAUTH2 for IMAP and the Gmail API for sending.",
+			Description: "Sign in via Google's authorization-code + PKCE flow with a loopback redirect. Default uses the Gmail API (sensitive scope, long-lived refresh tokens). Optional 'full' mode falls back to IMAP/SMTP XOAUTH2 via mail.google.com (restricted scope, weekly re-auth in Testing mode).",
 			ID:          LoginFlowIDOAuthGmail,
 		})
 	}

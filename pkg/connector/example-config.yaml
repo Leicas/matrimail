@@ -23,10 +23,58 @@ email_processing:
     # Attempt gzip for oversized original HTML/text bodies before attaching
     gzip_large_bodies: true
 
-# Gmail OAuth — required if you want to connect Gmail accounts via OAuth (recommended).
-# Create a "Desktop app" OAuth 2.0 Client at https://console.cloud.google.com/apis/credentials
-# and paste the client_id + client_secret here. Without these, Gmail accounts can still
-# connect via the legacy app-password+SMTP path.
+# Gmail OAuth — required if you want to connect Gmail / Workspace accounts
+# without app passwords. Without this block, Gmail accounts can still connect
+# via the legacy app-password + IMAP path under the email-password flow.
+#
+# matrimail uses Google's Authorization Code + PKCE + RFC 8252 loopback redirect
+# (NOT the deprecated device-code flow, which Google rejects for the
+# https://mail.google.com/ scope). See docs/gmail-oauth-setup.md for the full
+# walk-through; quick summary:
+#
+#   1. Create a Google Cloud project at https://console.cloud.google.com.
+#   2. Enable the Gmail API for that project.
+#   3. Configure the OAuth consent screen:
+#        - User Type: External
+#        - Add scope https://www.googleapis.com/auth/gmail.modify (and
+#          https://www.googleapis.com/auth/gmail.send) for default mode, OR
+#          https://mail.google.com/ for full mode.
+#        - Add yourself (and any other users) under "Test users" — up to 100.
+#   4. Credentials → Create OAuth client ID → Application type: Desktop app.
+#   5. Paste the resulting client_id and client_secret below.
+#
+# Note on token lifetimes: while your OAuth project is in "Testing" publishing
+# status, refresh tokens issued to test users EXPIRE AFTER 7 DAYS. To get
+# long-lived tokens you must publish to "In production":
+#   - For default scope_mode (gmail.modify): publishing requires Google
+#     verification but NOT a CASA assessment — achievable for self-hosted users.
+#   - For scope_mode=full (mail.google.com): publishing requires verification
+#     PLUS an annual CASA Tier 2 security assessment ($500–$4,500/yr). For most
+#     self-hosted bridges this means staying in Testing forever and re-auth'ing
+#     weekly. If you need IMAP semantics, this is the trade-off.
 gmail_oauth:
+    # Required: the Desktop app client credentials from step 5 above.
     client_id: ""
     client_secret: ""
+
+    # Optional: address the OAuth callback listener binds to. Default
+    # 127.0.0.1:0 lets the OS pick a random free port. Set a stable port like
+    # 127.0.0.1:8888 if you're SSH-port-forwarding from a workstation to a
+    # remote bridge host (you'll need a matching `ssh -L 8888:127.0.0.1:8888`).
+    # SECURITY: must always be loopback (127.0.0.1, ::1, or localhost) — the
+    # bridge refuses to bind to public interfaces.
+    listener_address: "127.0.0.1:0"
+
+    # Optional: which scope set to request by default. Users can override
+    # per-login by typing 'modify' or 'full' in the second field of the OAuth
+    # email prompt.
+    #   modify (recommended): Gmail API only. Sensitive scope; verification
+    #     required to publish but no CASA. Long-lived tokens once published.
+    #     Inbound delivery uses users.history.list polling (every 30s).
+    #   full (advanced): mail.google.com (IMAP + SMTP via XOAUTH2). Restricted
+    #     scope. Locked into Testing mode in practice → 7-day refresh tokens.
+    default_scope_mode: "modify"
+
+    # Optional: how long the loopback listener waits for the user's browser
+    # callback before timing out. Default 600 (10 minutes).
+    callback_timeout_seconds: 600

@@ -90,6 +90,7 @@ var (
 	EmailNotLoggedIn      = status.BridgeStateErrorCode("E-EMAIL-001")
 	EmailConnectionFailed = status.BridgeStateErrorCode("E-EMAIL-002")
 	EmailAuthFailure      = status.BridgeStateErrorCode("E-EMAIL-005")
+	// EmailReauthRequired ("E-EMAIL-006") is defined in reauth.go.
 )
 
 // extractEmailCredentials extracts email and username from login metadata or login ID
@@ -144,19 +145,50 @@ func (ec *EmailConnector) loadAccountCredentials(ctx context.Context, userMXID, 
 //
 // When the account's saved auth_type is "oauth-gmail" we build an OAuth
 // client and wire a refresh-aware TokenProvider so each (re)connect mints a
-// fresh access token via the saved refresh token. This is the simpler of the
-// two refresh strategies: tokens expire ~1h, but IMAP reconnects already
-// happen on errors (and any IDLE drop triggers one), so we just refresh on
-// every reconnect rather than tracking expiry separately.
+// fresh access token via the saved refresh token. Refresh failures that look
+// permanent (invalid_grant, revoked, 7-day Testing-mode expiry) trigger the
+// re-auth DM via EmailConnector.HandleRefreshError; the IMAP layer then
+// fails fast instead of looping reconnects against a dead token.
+//
+// Accounts flagged with auth_type='oauth-gmail-needs-reauth' are skipped at
+// connection time — they stay resident but inert until the user runs
+// !matrimail login. Same applies to scope-mode 'modify' accounts: those
+// don't have IMAP authorization and are served by the Gmail API inbound
+// poller in inbound_gmail_api.go, not by this client.
 func (ec *EmailConnector) createIMAPClient(emailClient *EmailClient, login *bridgev2.UserLogin) error {
 	logger := login.Log.With().Str("component", "imap").Logger()
 
-	// Detect OAuth account (auth_type column from Phase A).
-	provider, tok, err := ec.DB.LoadOAuthToken(context.Background(), login.UserMXID.String(), emailClient.Email)
+	info, err := ec.DB.GetOAuthAccount(context.Background(), login.UserMXID.String(), emailClient.Email)
 	if err != nil {
-		ec.Bridge.Log.Warn().Err(err).Msg("LoadOAuthToken failed; falling back to password auth")
+		ec.Bridge.Log.Warn().Err(err).Msg("GetOAuthAccount failed; falling back to password auth")
 	}
-	if provider != "" && tok != nil {
+	if info != nil {
+		// Skip connection setup if the account is flagged for re-auth — keep
+		// the row, surface the bridge state, and wait for the user.
+		if info.AuthType == AuthTypeOAuthGmailNeedsReauth {
+			ec.Bridge.Log.Info().
+				Str("email", emailClient.Email).
+				Msg("OAuth account is flagged for re-auth; skipping IMAP setup until user runs !matrimail login")
+			ReportReauthBridgeState(emailClient.stateCoordinator, emailClient.Email)
+			// Leave IMAPClient nil; the EmailClient.Connect() path treats
+			// nil IMAPClient as "no inbound transport configured" and reports
+			// EmailNotLoggedIn, which is acceptable.
+			return nil
+		}
+
+		// Modify-mode accounts use the Gmail API inbound poller (Phase 2),
+		// not IMAP. Skip IMAP setup; the poller is wired up separately.
+		if info.ScopeMode == ScopeModeModify {
+			ec.Bridge.Log.Debug().
+				Str("email", emailClient.Email).
+				Msg("OAuth account is in scope_mode=modify; using Gmail API inbound poller, skipping IMAP setup")
+			return nil
+		}
+
+		// Full-mode OAuth: IMAP via XOAUTH2.
+		if info.Token == nil {
+			return fmt.Errorf("account %s is OAuth-full but has no stored token", emailClient.Email)
+		}
 		oauthCfg := email.GmailOAuthConfig{
 			ClientID:     ec.Config.GmailOAuth.ClientID,
 			ClientSecret: ec.Config.GmailOAuth.ClientSecret,
@@ -166,12 +198,12 @@ func (ec *EmailConnector) createIMAPClient(emailClient *EmailClient, login *brid
 		}
 		// Use a long-lived background context for the TokenSource so token
 		// refreshes survive any per-request context cancellation.
-		ts := email.TokenSource(context.Background(), oauthCfg, tok)
+		ts := email.TokenSource(context.Background(), oauthCfg, info.Token)
 
 		imapClient, ierr := imap.NewClientOAuth(
 			emailClient.Email,
 			emailClient.Username,
-			tok.AccessToken,
+			info.Token.AccessToken,
 			login,
 			&logger,
 			ec.Config.Logging.Sanitized,
@@ -184,14 +216,21 @@ func (ec *EmailConnector) createIMAPClient(emailClient *EmailClient, login *brid
 		if ierr != nil {
 			return fmt.Errorf("failed to create OAuth IMAP client: %w", ierr)
 		}
-		// Refresh-on-reconnect provider. Persist new tokens whenever the
-		// underlying TokenSource hands us back a freshly minted one so a
-		// bridge restart doesn't lose the latest access token.
+		// Refresh-on-reconnect provider with permanent-failure detection.
+		// Persist new tokens whenever the underlying TokenSource hands us a
+		// freshly minted one so a bridge restart doesn't lose the latest
+		// access token; on a permanent refresh failure flip the account to
+		// needs-reauth and fire the DM.
 		userMXID := login.UserMXID.String()
 		emailAddr := emailClient.Email
+		provider := info.Provider
+		scopeMode := info.ScopeMode
 		imapClient.SetTokenProvider(func(ctx context.Context) (string, error) {
 			fresh, terr := ts.Token()
 			if terr != nil {
+				if ec.HandleRefreshError(ctx, login, userMXID, emailAddr, scopeMode, terr) {
+					ReportReauthBridgeState(emailClient.stateCoordinator, emailAddr)
+				}
 				return "", terr
 			}
 			// Best-effort persistence. Failures are non-fatal — the in-memory
@@ -233,6 +272,38 @@ func (ec *EmailConnector) createIMAPClient(emailClient *EmailClient, login *brid
 	}
 
 	return nil
+}
+
+// startGmailInboundIfApplicable spins up the Gmail-API inbound poller for
+// scope-mode='modify' OAuth accounts. No-op for password-mode accounts,
+// for full-mode OAuth (handled by IMAP), and for accounts flagged for
+// re-auth.
+func (ec *EmailConnector) startGmailInboundIfApplicable(ctx context.Context, emailClient *EmailClient, login *bridgev2.UserLogin, account *EmailAccount) error {
+	if account.AuthType != AuthTypeOAuthGmail {
+		return nil // password mode or needs-reauth — no Gmail-API poller
+	}
+	info, err := ec.DB.GetOAuthAccount(ctx, login.UserMXID.String(), emailClient.Email)
+	if err != nil {
+		return fmt.Errorf("get oauth account: %w", err)
+	}
+	if info == nil || info.Token == nil {
+		return nil
+	}
+	if info.ScopeMode != ScopeModeModify {
+		return nil
+	}
+	oauthCfg := email.GmailOAuthConfig{
+		ClientID:     ec.Config.GmailOAuth.ClientID,
+		ClientSecret: ec.Config.GmailOAuth.ClientSecret,
+	}
+	if oauthCfg.ClientID == "" || oauthCfg.ClientSecret == "" {
+		return fmt.Errorf("gmail_oauth not configured but account %s is OAuth", emailClient.Email)
+	}
+	base := email.TokenSource(context.Background(), oauthCfg, info.Token)
+	ts := newReauthAwareTokenSource(base, ec, login,
+		login.UserMXID.String(), emailClient.Email, info.Provider, info.ScopeMode)
+
+	return ec.GmailInbound.Start(ctx, login, emailClient.Email, account.MonitoredFolders, ts)
 }
 
 // startClientConnections starts the client connection and registration processes
@@ -301,7 +372,7 @@ func (ec *EmailConnector) LoadUserLogin(ctx context.Context, login *bridgev2.Use
 		emailClient.MonitoredFolders = []string{"INBOX"}
 	}
 
-	// Create IMAP client
+	// Create IMAP client (skipped for modify-mode and needs-reauth accounts)
 	if err := ec.createIMAPClient(emailClient, login); err != nil {
 		return err
 	}
@@ -313,6 +384,15 @@ func (ec *EmailConnector) LoadUserLogin(ctx context.Context, login *bridgev2.Use
 		// Outbound failure shouldn't block inbound — log and continue with a
 		// nil Sender. HandleMatrixMessage will reject sends with a clear error.
 		ec.Bridge.Log.Warn().Err(err).Str("email", emailClient.Email).Msg("Failed to build outbound Sender; inbound still functional")
+	}
+
+	// Spawn the Gmail-API inbound poller for modify-mode accounts. The poller
+	// is independent of the IMAP client (which is skipped for modify-mode in
+	// createIMAPClient) and runs on its own goroutine. needs-reauth accounts
+	// also skip the poller — it would just hammer Google with a dead refresh
+	// token.
+	if err := ec.startGmailInboundIfApplicable(ctx, emailClient, login, account); err != nil {
+		ec.Bridge.Log.Warn().Err(err).Str("email", emailClient.Email).Msg("Failed to start Gmail inbound poller")
 	}
 
 	// Start client connections
@@ -342,7 +422,7 @@ func (ec *EmailConnector) buildSender(ctx context.Context, emailClient *EmailCli
 		}
 	}
 
-	if account.AuthType == AuthTypeOAuthGmail {
+	if account.AuthType == AuthTypeOAuthGmail || account.AuthType == AuthTypeOAuthGmailNeedsReauth {
 		// OAuth path — load token and build a refresh-aware TokenSource.
 		oauthCfg := email.GmailOAuthConfig{
 			ClientID:     ec.Config.GmailOAuth.ClientID,
@@ -351,16 +431,28 @@ func (ec *EmailConnector) buildSender(ctx context.Context, emailClient *EmailCli
 		if oauthCfg.ClientID == "" || oauthCfg.ClientSecret == "" {
 			return fmt.Errorf("account %s is OAuth but bridge has no gmail_oauth config", emailClient.Email)
 		}
-		_, tok, err := ec.DB.LoadOAuthToken(context.Background(), login.UserMXID.String(), emailClient.Email)
+		info, err := ec.DB.GetOAuthAccount(context.Background(), login.UserMXID.String(), emailClient.Email)
 		if err != nil {
 			return fmt.Errorf("load oauth token: %w", err)
 		}
-		if tok == nil {
+		if info == nil || info.Token == nil {
 			return fmt.Errorf("account %s is OAuth but has no stored token", emailClient.Email)
 		}
+		// If the account has been flagged for re-auth, don't build a working
+		// sender — outbound sends would just hammer Google with a dead
+		// refresh token and re-fire the re-auth DM. Surface a clear error.
+		if info.AuthType == AuthTypeOAuthGmailNeedsReauth {
+			return fmt.Errorf("account %s needs re-auth; run !matrimail login", emailClient.Email)
+		}
 		// Long-lived background context so token refreshes survive any
-		// per-request context cancellation.
-		senderAccount.OAuthTokenSource = email.TokenSource(context.Background(), oauthCfg, tok)
+		// per-request context cancellation. Wrap with reauthAwareTokenSource
+		// so refresh failures during outbound sends fire the re-auth DM
+		// (the IMAP path has its own SetTokenProvider hook).
+		base := email.TokenSource(context.Background(), oauthCfg, info.Token)
+		senderAccount.OAuthTokenSource = newReauthAwareTokenSource(
+			base, ec, login,
+			login.UserMXID.String(), emailClient.Email, info.Provider, info.ScopeMode,
+		)
 		// Workspace custom domains aren't gmail.com; OAuth presence is the
 		// real signal that this account speaks the Gmail API.
 		senderAccount.IsGmail = true

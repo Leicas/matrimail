@@ -8,9 +8,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Leicas/matrimail/pkg/imap"
+	gmail "google.golang.org/api/gmail/v1"
+	"google.golang.org/api/option"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/commands"
+
+	"github.com/Leicas/matrimail/pkg/email"
+	"github.com/Leicas/matrimail/pkg/imap"
 )
 
 var (
@@ -1200,4 +1204,178 @@ To change the monitored folders for **%s**, you'll need to re-authenticate.
 2. Use `+"`!matrimail login`"+` to reconnect and choose new folders
 
 💡 **Tip:** Your existing Matrix rooms will remain - only the folders being monitored will change.`, targetEmail, targetEmail)
+}
+
+// fnOAuth handles `!matrimail oauth <subcommand>`. Two subcommands:
+//
+//   - paste-token <email> <refresh_token>: bootstraps an account with a
+//     user-supplied refresh token. The "headless escape hatch" — for users
+//     whose bridge host can't expose a loopback port to a browser. Run the
+//     OAuth flow elsewhere (e.g. against the same client_id from a tool that
+//     supports loopback), then paste the refresh token here.
+//
+//   - revoke <email>: revokes the refresh token at Google's end (severing
+//     matrimail's access from the user's Google account dashboard) and
+//     clears the local OAuth state. Equivalent to logout + manual revoke
+//     in one step.
+func fnOAuth(ce *commands.Event, connector *EmailConnector) {
+	if len(ce.Args) == 0 {
+		ce.Reply(`**!matrimail oauth — subcommands**
+
+- ` + "`!matrimail oauth paste-token <email> <refresh_token>`" + ` — register
+  an account using a refresh token you obtained out-of-band (headless
+  deployments). Token is validated against Google before being stored.
+- ` + "`!matrimail oauth revoke <email>`" + ` — revoke matrimail's access at
+  Google and clear the local OAuth state for the account.`)
+		return
+	}
+
+	sub := strings.ToLower(ce.Args[0])
+	switch sub {
+	case "paste-token", "paste":
+		fnOAuthPasteToken(ce, connector)
+	case "revoke":
+		fnOAuthRevoke(ce, connector)
+	default:
+		ce.Reply("❌ Unknown subcommand: `%s`. Try `!matrimail oauth` for help.", sub)
+	}
+}
+
+// fnOAuthPasteToken implements `!matrimail oauth paste-token <email> <refresh_token>`.
+// Validates the refresh token by exchanging it against Google's /token
+// endpoint, fetches the authorized account's profile to confirm identity,
+// then persists the token under an account row.
+func fnOAuthPasteToken(ce *commands.Event, connector *EmailConnector) {
+	if len(ce.Args) < 3 {
+		ce.Reply(`Usage: ` + "`!matrimail oauth paste-token <email> <refresh_token>`" + `
+
+Get a refresh token by running the OAuth authorization flow on a machine that
+has a browser and can reach a loopback port. matrimail uses the standard
+Google "Desktop app" client; any tool that does authorization-code + PKCE
+against your gmail_oauth.client_id will produce a compatible refresh token
+(e.g. ` + "`oauth2l`" + `, ` + "`mutt_oauth2.py`" + `, etc.).
+
+The token will be validated against Google before being stored.`)
+		return
+	}
+
+	emailAddr := strings.TrimSpace(ce.Args[1])
+	refreshToken := strings.TrimSpace(ce.Args[2])
+	if emailAddr == "" || refreshToken == "" {
+		ce.Reply("❌ Email and refresh token are both required.")
+		return
+	}
+	if connector.Config.GmailOAuth.ClientID == "" || connector.Config.GmailOAuth.ClientSecret == "" {
+		ce.Reply("❌ `gmail_oauth.client_id` / `client_secret` are not configured on this bridge. Ask your admin to set them in `config.yaml`.")
+		return
+	}
+
+	ctx := context.Background()
+	cfg := email.GmailOAuthConfig{
+		ClientID:     connector.Config.GmailOAuth.ClientID,
+		ClientSecret: connector.Config.GmailOAuth.ClientSecret,
+	}
+
+	// Validate by exchanging for an access token.
+	tok, err := email.ExchangeRefreshToken(ctx, cfg, refreshToken)
+	if err != nil {
+		ce.Reply("❌ Refresh token validation failed: %v\n\nDouble-check that the token was issued by the same `client_id` configured on this bridge, and that the user hasn't revoked matrimail's access.", err)
+		return
+	}
+
+	// Confirm identity matches the email argument.
+	ts := email.TokenSource(ctx, cfg, tok)
+	svc, err := gmail.NewService(ctx, option.WithTokenSource(ts))
+	if err != nil {
+		ce.Reply("❌ Could not construct Gmail client: %v", err)
+		return
+	}
+	prof, err := svc.Users.GetProfile("me").Context(ctx).Do()
+	if err != nil {
+		ce.Reply("❌ Gmail profile lookup failed: %v", err)
+		return
+	}
+	if !strings.EqualFold(prof.EmailAddress, emailAddr) {
+		ce.Reply("❌ Authorized account is **%s**, not the email you specified (**%s**). Aborting.", prof.EmailAddress, emailAddr)
+		return
+	}
+
+	// Persist. Pre-create the account row if missing, then save the token
+	// with explicit scope_mode (default modify; user can override later by
+	// re-logging in interactively if they need full mode).
+	account := &EmailAccount{
+		UserMXID:         ce.User.MXID.String(),
+		Email:            emailAddr,
+		Username:         emailAddr,
+		Password:         "", // unused for OAuth
+		Host:             "imap.gmail.com",
+		Port:             993,
+		TLS:              true,
+		CreatedAt:        time.Now(),
+		LastSyncTime:     time.Now(),
+		MonitoredFolders: []string{"INBOX"},
+	}
+	if err := connector.DB.UpsertAccount(ctx, account); err != nil {
+		ce.Reply("❌ Failed to create account row: %v", err)
+		return
+	}
+	scopeMode := connector.Config.GmailOAuth.EffectiveDefaultScopeMode()
+	if err := connector.DB.SaveOAuthTokenWithScope(ctx, ce.User.MXID.String(), emailAddr,
+		OAuthProviderGoogle, scopeMode, tok); err != nil {
+		ce.Reply("❌ Failed to persist OAuth token: %v", err)
+		return
+	}
+
+	ce.Reply(`✅ **Account registered:** %s (scope_mode=%s)
+
+Run `+"`!matrimail status`"+` to confirm the bridge picked up the new account.`, emailAddr, scopeMode)
+}
+
+// fnOAuthRevoke implements `!matrimail oauth revoke <email>`. Revokes the
+// stored refresh token at Google, then flips the account to needs-reauth so
+// it stops trying to refresh. The user can then run `!matrimail logout` to
+// fully delete it, or `!matrimail login` to re-authorize.
+func fnOAuthRevoke(ce *commands.Event, connector *EmailConnector) {
+	if len(ce.Args) < 2 {
+		ce.Reply("Usage: `!matrimail oauth revoke <email>`")
+		return
+	}
+	emailAddr := strings.TrimSpace(ce.Args[1])
+	if emailAddr == "" {
+		ce.Reply("❌ Email is required.")
+		return
+	}
+
+	ctx := context.Background()
+	info, err := connector.DB.GetOAuthAccount(ctx, ce.User.MXID.String(), emailAddr)
+	if err != nil {
+		ce.Reply("❌ Failed to load account: %v", err)
+		return
+	}
+	if info == nil || info.Token == nil {
+		ce.Reply("❌ No OAuth account found for **%s**.", emailAddr)
+		return
+	}
+
+	// Best-effort revoke; don't fail the command if Google's endpoint is
+	// flaky (the local state flip is the most important thing).
+	if err := email.RevokeToken(ctx, info.Token.RefreshToken); err != nil {
+		connector.Bridge.Log.Warn().Err(err).Str("email", emailAddr).Msg("Token revocation at Google failed")
+	}
+	if err := connector.MarkAccountNeedsReauth(ctx, ce.User.MXID.String(), emailAddr); err != nil {
+		ce.Reply("⚠️ Token revoked at Google but local flag failed: %v", err)
+		return
+	}
+
+	// Stop the inbound poller for modify-mode accounts so it doesn't keep
+	// hitting Google with a dead token before the next bridge restart.
+	if connector.GmailInbound != nil {
+		connector.GmailInbound.Stop(ce.User.MXID.String(), emailAddr)
+	}
+
+	ce.Reply(`🔐 **OAuth access revoked for %s.**
+
+The refresh token has been invalidated at Google and the account is paused
+locally. To use this account again, run `+"`!matrimail login`"+`. To delete it
+entirely, run `+"`!matrimail logout %s`"+`.`, emailAddr, emailAddr)
 }

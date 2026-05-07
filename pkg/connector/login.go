@@ -5,10 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"sync"
 	"time"
 
-	"golang.org/x/oauth2"
 	gmail "google.golang.org/api/gmail/v1"
 	"google.golang.org/api/option"
 	"maunium.net/go/mautrix/bridgev2"
@@ -31,8 +29,12 @@ const (
 //
 //   - LoginFlowIDPassword: classic IMAP-app-password flow. Steps:
 //     credentials → folder_selection → confirmation → complete.
-//   - LoginFlowIDOAuthGmail: Phase B device-code flow. Steps:
-//     oauth_email → oauth_wait → folder_selection → confirmation → complete.
+//   - LoginFlowIDOAuthGmail: Authorization-Code + PKCE + RFC 8252 loopback
+//     flow. Steps: oauth_email → oauth_wait → folder_selection →
+//     confirmation → complete. The browser redirect lands on a transient
+//     127.0.0.1 listener owned by EmailLoginProcess; the framework's
+//     LoginProcessDisplayAndWait.Wait() blocks until the listener delivers a
+//     code (or the listener times out / errors).
 //
 // flowID is set by EmailConnector.CreateLogin from the user's flow pick.
 type EmailLoginProcess struct {
@@ -52,22 +54,16 @@ type EmailLoginProcess struct {
 	testClient       *imap.Client      // Validated IMAP client (reused for folder listing)
 
 	// OAuth-flow state — only populated for LoginFlowIDOAuthGmail.
-	// dcr is the device-code dance kickoff; pollResult is filled by the
-	// background goroutine when the user authorizes (or it errors out).
 	//
-	// pollWaitCh is closed when the polling goroutine exits, regardless of
-	// outcome. Phase D switched the wait UX from a user-typed-"done" prompt
-	// to a LoginStepTypeDisplayAndWait flow whose Wait() method blocks on
-	// this channel — bridgev2's framework drives the wait, not the user.
-	oauthOnce   sync.Once
-	oauthCtx    context.Context
-	oauthCancel context.CancelFunc
-	dcr         *email.DeviceCodeResponse
-	pollMu      sync.Mutex
-	pollDone    bool
-	pollToken   *oauth2.Token
-	pollErr     error
-	pollWaitCh  chan struct{}
+	// listener is the loopback HTTP listener serving Google's redirect; the
+	// framework calls Wait() while it's running, and we close it from
+	// Cancel() and from the success path. pkceVerifier and state are
+	// generated once at oauth_email-step entry and consumed when exchanging
+	// the code. scopeMode controls which scope set the auth URL requested.
+	listener      *OAuthListener
+	pkceVerifier  string
+	state         string
+	scopeMode     string // ScopeModeModify (default) or ScopeModeFull
 }
 
 var (
@@ -84,7 +80,8 @@ type EmailLoginMetadata struct {
 
 // Start begins the login process. The first prompt depends on flowID:
 // for LoginFlowIDOAuthGmail we ask for the email up front (so we know which
-// account the device-code authorizes), then kick off DeviceCodeStart.
+// account the OAuth code authorizes), then build the auth URL and spin up the
+// loopback callback listener.
 func (elp *EmailLoginProcess) Start(ctx context.Context) (*bridgev2.LoginStep, error) {
 	if elp.flowID == LoginFlowIDOAuthGmail {
 		return &bridgev2.LoginStep{
@@ -92,12 +89,21 @@ func (elp *EmailLoginProcess) Start(ctx context.Context) (*bridgev2.LoginStep, e
 			StepID:       "oauth_email",
 			Instructions: elp.buildOAuthEmailPrompt(),
 			UserInputParams: &bridgev2.LoginUserInputParams{
-				Fields: []bridgev2.LoginInputDataField{{
-					Type:        bridgev2.LoginInputFieldTypeEmail,
-					ID:          "email",
-					Name:        "Email Address",
-					Description: "Your Gmail / Workspace address",
-				}},
+				Fields: []bridgev2.LoginInputDataField{
+					{
+						Type:        bridgev2.LoginInputFieldTypeEmail,
+						ID:          "email",
+						Name:        "Email Address",
+						Description: "Your Gmail / Workspace address",
+					},
+					{
+						// Free-text optional override — empty string means "use the configured default".
+						Type:        bridgev2.LoginInputFieldTypeUsername,
+						ID:          "scope_mode",
+						Name:        "Scope mode (optional)",
+						Description: "Leave blank for default. Type 'modify' for Gmail-API-only (recommended) or 'full' for IMAP/SMTP XOAUTH2 (advanced).",
+					},
+				},
 			},
 		}, nil
 	}
@@ -127,15 +133,35 @@ func (elp *EmailLoginProcess) Start(ctx context.Context) (*bridgev2.LoginStep, e
 // buildOAuthEmailPrompt is the first-step UI for LoginFlowIDOAuthGmail. We
 // only need the email here; the OAuth dance happens after.
 func (elp *EmailLoginProcess) buildOAuthEmailPrompt() string {
+	defaultMode := elp.connector.Config.GmailOAuth.EffectiveDefaultScopeMode()
 	return `**Matrimail — Gmail OAuth Login**
 
 🔐 Sign in with your Google account, no app password required.
 
 **Step 1 of 3** — enter the Gmail / Google Workspace address you want to bridge.
 
-After you submit, the bridge will hand back a short URL + code; open it in your
-browser, sign in to Google, and authorize the matrimail OAuth client. The bridge
-will detect the authorization and continue automatically.
+When you submit, the bridge will hand back a single URL. Open it in any browser
+(your phone, laptop, anywhere), sign in to Google, and authorize matrimail. The
+bridge will detect the authorization and continue automatically.
+
+**Scope modes:**
+- ` + "`modify`" + ` (recommended): uses the Gmail API for both reading and sending. Sensitive
+  scope, no CASA assessment required, supports long-lived refresh tokens.
+- ` + "`full`" + ` (advanced): uses IMAP/SMTP XOAUTH2 via the ` + "`mail.google.com`" + ` scope.
+  Restricted scope — your OAuth project will be locked into Google's "Testing"
+  publishing status, which means refresh tokens **expire every 7 days**. Pick this
+  only if you need IMAP semantics (e.g. your Workspace admin disabled the Gmail API).
+
+Default mode on this bridge: **` + defaultMode + `**.
+
+**Running matrimail on a remote server?** Set up an SSH local port-forward
+**before** opening the URL:
+
+` + "```\nssh -L 8888:127.0.0.1:8888 user@your-bridge-host\n```" + `
+
+…and configure ` + "`gmail_oauth.listener_address: 127.0.0.1:8888`" + ` in your
+matrimail config. Or use the ` + "`!matrimail oauth paste-token`" + ` admin command
+if you can't expose a browser-reachable port at all.
 
 *Need help?* ` + "`!matrimail help`"
 }
@@ -166,11 +192,12 @@ Custom IMAP servers - Auto-detected
 **Need help?** Use ` + "`!matrimail help`" + ` for more information or ` + "`!matrimail status`" + ` to check connection status.`
 }
 
-// Cancel cancels the login process and tears down any in-flight OAuth poll
-// goroutine so a re-issued !matrimail login doesn't leak a polling worker.
+// Cancel cancels the login process and tears down any in-flight OAuth
+// loopback listener so a re-issued !matrimail login doesn't leak a port or a
+// goroutine.
 func (elp *EmailLoginProcess) Cancel() {
-	if elp.oauthCancel != nil {
-		elp.oauthCancel()
+	if elp.listener != nil {
+		elp.listener.Close()
 	}
 }
 
@@ -781,17 +808,22 @@ Contact your email administrator or check your provider's documentation
 // IMAP monitoring is now handled by the EmailClient in client.go
 
 // ----------------------------------------------------------------------------
-// OAuth (Gmail) login flow — Phase B
+// OAuth (Gmail) login flow — Authorization Code + PKCE + RFC 8252 loopback
 // ----------------------------------------------------------------------------
 
-// handleOAuthEmail captures the user's email, kicks off Google's device-code
-// dance, and returns the URL+code for the user to enter in their browser.
-// A background goroutine polls the token endpoint; the next user submission
-// (any input) advances to handleOAuthWait.
+// handleOAuthEmail captures the user's email + scope-mode choice, generates
+// PKCE+state, spins up a transient loopback HTTP listener on 127.0.0.1, builds
+// the Google authorization URL, and returns it as a DisplayAndWait step. The
+// bridgev2 framework then calls Wait() (below), which blocks until the
+// listener delivers a code (success) or an error (state mismatch, user
+// cancelled, timeout).
 func (elp *EmailLoginProcess) handleOAuthEmail(ctx context.Context, input map[string]string) (*bridgev2.LoginStep, error) {
 	for k, v := range input {
-		if k == "email" {
+		switch k {
+		case "email":
 			elp.email = strings.TrimSpace(v)
+		case "scope_mode":
+			elp.scopeMode = strings.ToLower(strings.TrimSpace(v))
 		}
 	}
 	if elp.email == "" {
@@ -801,14 +833,26 @@ func (elp *EmailLoginProcess) handleOAuthEmail(ctx context.Context, input map[st
 		elp.username = elp.email
 	}
 
-	cfg := elp.connector.Config.GmailOAuth
-	if cfg.ClientID == "" || cfg.ClientSecret == "" {
-		return nil, fmt.Errorf("gmail_oauth.client_id / client_secret not configured on this bridge — ask your admin to set up Gmail OAuth, or use the email-password flow")
+	// Resolve scope mode: empty input → bridge default; otherwise validate.
+	switch elp.scopeMode {
+	case "":
+		elp.scopeMode = elp.connector.Config.GmailOAuth.EffectiveDefaultScopeMode()
+	case ScopeModeFull, ScopeModeModify:
+		// ok
+	default:
+		return nil, fmt.Errorf("scope_mode must be empty, 'modify', or 'full' (got %q)", elp.scopeMode)
 	}
 
-	// Pre-create the account row so SaveOAuthToken (which UPDATEs in place)
-	// finds something to write into. Persist provider info early so the
-	// account is recoverable even if the bridge restarts mid-poll.
+	cfg := elp.connector.Config.GmailOAuth
+	if cfg.ClientID == "" || cfg.ClientSecret == "" {
+		return nil, fmt.Errorf("gmail_oauth.client_id / client_secret not configured on this bridge — see docs/gmail-oauth-setup.md, or use the email-password flow")
+	}
+
+	// Pre-create the account row so SaveOAuthTokenWithScope (which UPDATEs in
+	// place) finds something to write into. The row will be filled in with
+	// the real OAuth token after the callback fires; if the user abandons
+	// the flow, the row stays in password mode with an empty password —
+	// harmless, and !matrimail logout cleans it up.
 	parts := strings.Split(elp.email, "@")
 	if len(parts) != 2 {
 		return nil, fmt.Errorf("invalid email format: %s", elp.email)
@@ -838,145 +882,153 @@ func (elp *EmailLoginProcess) handleOAuthEmail(ctx context.Context, input map[st
 		return nil, fmt.Errorf("failed to pre-create account row: %w", err)
 	}
 
-	// Kick off the device-code dance using a long-lived (10min) context that
-	// outlives the synchronous bridgev2 step call.
-	emailCfg := email.GmailOAuthConfig{ClientID: cfg.ClientID, ClientSecret: cfg.ClientSecret}
-	dcCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-	dcr, err := email.DeviceCodeStart(dcCtx, emailCfg)
+	// Generate PKCE verifier + state and stash both on the login process so
+	// finishOAuthWait can pass them to ExchangeCode.
+	verifier, challenge, err := email.GeneratePKCE()
 	if err != nil {
-		cancel()
-		return nil, fmt.Errorf("failed to start OAuth device flow: %w", err)
+		return nil, fmt.Errorf("generate PKCE: %w", err)
 	}
-	elp.dcr = dcr
-	elp.oauthCtx = dcCtx
-	elp.oauthCancel = cancel
+	state, err := email.GenerateState()
+	if err != nil {
+		return nil, fmt.Errorf("generate state: %w", err)
+	}
+	elp.pkceVerifier = verifier
+	elp.state = state
 
-	// Poll asynchronously. With LoginStepTypeDisplayAndWait, bridgev2's
-	// LoginProcess.Wait method (see Wait below) blocks on this goroutine's
-	// completion channel and auto-advances the flow — no user input needed.
-	elp.pollWaitCh = make(chan struct{})
-	go elp.runOAuthPoll(emailCfg)
+	// Spin up the loopback listener BEFORE building the auth URL so we have
+	// the actual bound port for the redirect_uri.
+	listener, err := StartOAuthListener(
+		cfg.EffectiveListenerAddress(),
+		state,
+		cfg.EffectiveCallbackTimeout(),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("start OAuth callback listener: %w", err)
+	}
+	elp.listener = listener
+
+	scopes := email.ScopesForMode(elp.scopeMode)
+	authURL, err := email.BuildAuthURL(
+		email.GmailOAuthConfig{ClientID: cfg.ClientID, ClientSecret: cfg.ClientSecret},
+		listener.RedirectURI(),
+		state,
+		challenge,
+		elp.email, // login_hint pre-fills Google's account chooser
+		scopes,
+	)
+	if err != nil {
+		listener.Close()
+		return nil, fmt.Errorf("build auth URL: %w", err)
+	}
 
 	elp.currentStep = "oauth_wait"
+	scopeNote := ""
+	if elp.scopeMode == ScopeModeFull {
+		scopeNote = "\n⚠️ **Full mode**: refresh tokens issued by an unverified Google project in Testing status expire after 7 days. You'll need to re-run `!matrimail login` weekly unless you publish your OAuth project (which for `mail.google.com` requires Google verification + CASA assessment)."
+	}
 	return &bridgev2.LoginStep{
 		Type:   bridgev2.LoginStepTypeDisplayAndWait,
 		StepID: "oauth_wait",
 		Instructions: fmt.Sprintf(`🔐 **Step 2 of 3 — Authorize matrimail with Google**
 
-1. Open this URL in your browser: **%s**
-2. Sign in to **%s** if prompted.
-3. Enter this code: **%s**
-4. Authorize matrimail.
+Open this URL in any browser (phone, laptop, doesn't matter — it just needs to
+reach **%s** on this host):
 
-This code expires in %d seconds.
+%s
 
-The bridge will detect authorization automatically and continue — no further action needed here.`,
-			dcr.VerificationURL, elp.email, dcr.UserCode, dcr.ExpiresIn),
+Sign in as **%s** and authorize matrimail. The bridge will detect the redirect
+automatically and continue. This URL expires in %s.
+
+Scope mode: **%s**.%s
+
+🚧 *Headless server tip:* if your matrimail host has no browser, set up an SSH
+local port-forward from your workstation **before** opening the URL — see the
+prompt from Step 1.`,
+			listener.RedirectURI(),
+			authURL,
+			elp.email,
+			cfg.EffectiveCallbackTimeout().String(),
+			elp.scopeMode,
+			scopeNote,
+		),
 		DisplayAndWaitParams: &bridgev2.LoginDisplayAndWaitParams{
-			Type: bridgev2.LoginDisplayTypeCode,
-			Data: dcr.UserCode,
+			Type: bridgev2.LoginDisplayTypeURL,
+			Data: authURL,
 		},
 	}, nil
 }
 
-// runOAuthPoll runs in a goroutine spawned from handleOAuthEmail. It waits for
-// the user to authorize (or for the device code to expire) and stores the
-// resulting token (or error) on the login process. On exit it closes
-// pollWaitCh so EmailLoginProcess.Wait can unblock and advance the flow
-// without any user "done" input.
-func (elp *EmailLoginProcess) runOAuthPoll(cfg email.GmailOAuthConfig) {
-	tok, err := email.DeviceCodePoll(elp.oauthCtx, cfg, elp.dcr)
-	elp.pollMu.Lock()
-	elp.pollDone = true
-	elp.pollToken = tok
-	elp.pollErr = err
-	ch := elp.pollWaitCh
-	elp.pollMu.Unlock()
-	if ch != nil {
-		close(ch)
-	}
-}
-
 // Wait satisfies bridgev2.LoginProcessDisplayAndWait. The framework calls
-// this after presenting the device-code step's URL+code to the user; we
-// block until the polling goroutine produces a token (or an error) and then
-// transition straight into folder selection without the user having to type
-// anything.
+// this after presenting the auth URL to the user; we block until the loopback
+// listener delivers a code (or fails) and then transition into folder
+// selection without further user input.
 //
-// Errors are returned to the framework, which surfaces them as login
-// failures. Context cancellation aborts the wait — typically only happens if
-// the user cancels the login from their client.
+// Context cancellation aborts the wait — typically only happens if the user
+// cancels the login from their client.
 func (elp *EmailLoginProcess) Wait(ctx context.Context) (*bridgev2.LoginStep, error) {
-	elp.pollMu.Lock()
-	ch := elp.pollWaitCh
-	elp.pollMu.Unlock()
-	if ch == nil {
-		return nil, errors.New("OAuth wait called before device-code start; this is a bridge bug")
+	if elp.listener == nil {
+		return nil, errors.New("OAuth wait called before listener start; this is a bridge bug")
 	}
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case <-ch:
+	code, err := elp.listener.Wait(ctx)
+	// Always release the port — listener has already shut down on success
+	// but Close() is idempotent.
+	defer elp.listener.Close()
+	if err != nil {
+		return nil, fmt.Errorf("OAuth authorization failed: %w", err)
 	}
-	return elp.finishOAuthWait(ctx)
+	return elp.finishOAuthExchange(ctx, code)
 }
 
-// handleOAuthWait is the legacy LoginStepTypeUserInput handler. Phase D
-// switched the OAuth wait to LoginStepTypeDisplayAndWait + Wait(), but we
-// keep this as a defensive fallback for clients that for some reason still
-// submit input against the old step ID. It just delegates to finishOAuthWait
-// once the poll has completed (or re-prompts if it hasn't yet, which can
-// happen when the user types into a stale form).
+// handleOAuthWait is a defensive fallback for clients that submit input
+// against the oauth_wait step ID instead of waiting on the listener. We
+// just check whether the listener has produced a code and either advance or
+// re-display the auth URL.
 func (elp *EmailLoginProcess) handleOAuthWait(ctx context.Context, _ map[string]string) (*bridgev2.LoginStep, error) {
-	elp.pollMu.Lock()
-	done := elp.pollDone
-	elp.pollMu.Unlock()
-	if !done {
+	if elp.listener == nil {
+		return nil, errors.New("OAuth wait called before listener start; this is a bridge bug")
+	}
+	// Non-blocking peek: the listener delivers exactly once on success.
+	select {
+	case code := <-elp.listenerCodeCh():
+		defer elp.listener.Close()
+		return elp.finishOAuthExchange(ctx, code)
+	case err := <-elp.listenerErrCh():
+		defer elp.listener.Close()
+		return nil, fmt.Errorf("OAuth authorization failed: %w", err)
+	default:
+		// Still waiting — re-show a "still waiting" message.
 		return &bridgev2.LoginStep{
-			Type:   bridgev2.LoginStepTypeUserInput,
-			StepID: "oauth_wait",
-			Instructions: fmt.Sprintf(`⏳ Still waiting for you to authorize at **%s** (code **%s**). The bridge is polling automatically.`, elp.dcr.VerificationURL, elp.dcr.UserCode),
-			UserInputParams: &bridgev2.LoginUserInputParams{
-				Fields: []bridgev2.LoginInputDataField{{
-					Type:        bridgev2.LoginInputFieldTypeUsername,
-					ID:          "ack",
-					Name:        "Acknowledge",
-					Description: "Reply once you've authorized (optional)",
-				}},
+			Type:         bridgev2.LoginStepTypeDisplayAndWait,
+			StepID:       "oauth_wait",
+			Instructions: "⏳ Still waiting for you to authorize in your browser. Open the URL from the previous message and finish the OAuth flow.",
+			DisplayAndWaitParams: &bridgev2.LoginDisplayAndWaitParams{
+				Type: bridgev2.LoginDisplayTypeURL,
+				Data: elp.listener.RedirectURI(),
 			},
 		}, nil
 	}
-	return elp.finishOAuthWait(ctx)
 }
 
-// finishOAuthWait converts the now-completed device-code poll into the next
-// LoginStep. Shared between the auto-advancing Wait path (Phase D) and the
-// legacy handleOAuthWait fallback.
-func (elp *EmailLoginProcess) finishOAuthWait(ctx context.Context) (*bridgev2.LoginStep, error) {
-	elp.pollMu.Lock()
-	tok := elp.pollToken
-	pErr := elp.pollErr
-	elp.pollMu.Unlock()
+// listenerCodeCh / listenerErrCh expose the listener's internal channels for
+// the defensive fallback peek in handleOAuthWait. The Wait() path doesn't
+// need them — it uses listener.Wait() directly.
+func (elp *EmailLoginProcess) listenerCodeCh() <-chan string { return elp.listener.codeCh }
+func (elp *EmailLoginProcess) listenerErrCh() <-chan error   { return elp.listener.errCh }
 
-	// Stop the poll context regardless of outcome.
-	if elp.oauthCancel != nil {
-		elp.oauthCancel()
-	}
+// finishOAuthExchange exchanges the authorization code for tokens, verifies
+// the authorized identity matches the user-entered email, persists the
+// token, and sets up folder selection.
+func (elp *EmailLoginProcess) finishOAuthExchange(ctx context.Context, code string) (*bridgev2.LoginStep, error) {
+	cfg := elp.connector.Config.GmailOAuth
+	emailCfg := email.GmailOAuthConfig{ClientID: cfg.ClientID, ClientSecret: cfg.ClientSecret}
 
-	if pErr != nil {
-		return nil, fmt.Errorf("OAuth authorization failed: %w", pErr)
-	}
-	if tok == nil {
-		return nil, errors.New("OAuth poll returned no token")
+	tok, err := email.ExchangeCode(ctx, emailCfg, code, elp.pkceVerifier, elp.listener.RedirectURI())
+	if err != nil {
+		return nil, fmt.Errorf("exchange code: %w", err)
 	}
 
 	// Verify the authorized identity matches what the user typed by hitting
-	// users.getProfile (cheap, no further scopes needed under
-	// https://mail.google.com/).
-	emailCfg := email.GmailOAuthConfig{
-		ClientID:     elp.connector.Config.GmailOAuth.ClientID,
-		ClientSecret: elp.connector.Config.GmailOAuth.ClientSecret,
-	}
+	// users.getProfile. Both `gmail.modify` and `mail.google.com` cover this.
 	ts := email.TokenSource(ctx, emailCfg, tok)
 	svc, err := gmail.NewService(ctx, option.WithTokenSource(ts))
 	if err != nil {
@@ -990,9 +1042,9 @@ func (elp *EmailLoginProcess) finishOAuthWait(ctx context.Context) (*bridgev2.Lo
 		return nil, fmt.Errorf("authorized account %s does not match the email you entered (%s); please restart login", prof.EmailAddress, elp.email)
 	}
 
-	// Persist token under the existing account row.
-	if err := elp.connector.DB.SaveOAuthToken(ctx, elp.user.MXID.String(), elp.email,
-		OAuthProviderGoogle, tok); err != nil {
+	// Persist token + scope mode under the existing account row.
+	if err := elp.connector.DB.SaveOAuthTokenWithScope(ctx, elp.user.MXID.String(), elp.email,
+		OAuthProviderGoogle, elp.scopeMode, tok); err != nil {
 		return nil, fmt.Errorf("save oauth token: %w", err)
 	}
 
@@ -1003,12 +1055,12 @@ func (elp *EmailLoginProcess) finishOAuthWait(ctx context.Context) (*bridgev2.Lo
 		elp.providerName = "Gmail"
 	}
 
-	// List folders via IMAP using the access token (XOAUTH2).
-	folders, err := elp.listFoldersOAuth(ctx, tok.AccessToken)
-	if err != nil {
-		// Fall back to INBOX-only — we still have a usable account; folder
-		// selection just becomes implicit.
-		elp.connector.Bridge.Log.Warn().Err(err).Msg("OAuth IMAP folder listing failed, falling back to INBOX only")
+	// Folder enumeration: IMAP for full-mode, Gmail labels for modify-mode.
+	folders, ferr := elp.enumerateFoldersForOAuth(ctx, svc, tok.AccessToken)
+	if ferr != nil || len(folders) == 0 {
+		if ferr != nil {
+			elp.connector.Bridge.Log.Warn().Err(ferr).Msg("OAuth folder enumeration failed, falling back to INBOX only")
+		}
 		elp.selectedNames = []string{"INBOX"}
 		elp.selectedFolders = []imap.FolderInfo{{
 			Name: "INBOX", Display: "INBOX", Icon: "📥", Type: imap.FolderTypeStandard,
@@ -1016,13 +1068,6 @@ func (elp *EmailLoginProcess) finishOAuthWait(ctx context.Context) (*bridgev2.Lo
 		return elp.completeLogin(ctx)
 	}
 	elp.availableFolders = folders
-	if len(folders) == 0 {
-		elp.selectedNames = []string{"INBOX"}
-		elp.selectedFolders = []imap.FolderInfo{{
-			Name: "INBOX", Display: "INBOX", Icon: "📥", Type: imap.FolderTypeStandard,
-		}}
-		return elp.completeLogin(ctx)
-	}
 	elp.currentStep = "folder_selection"
 	return &bridgev2.LoginStep{
 		Type:         bridgev2.LoginStepTypeUserInput,
@@ -1039,10 +1084,20 @@ func (elp *EmailLoginProcess) finishOAuthWait(ctx context.Context) (*bridgev2.Lo
 	}, nil
 }
 
-// listFoldersOAuth opens a one-shot IMAP connection authenticated via XOAUTH2
-// for folder enumeration. Uses imap.NewClientOAuth to keep the auth path
-// localized to one place.
-func (elp *EmailLoginProcess) listFoldersOAuth(ctx context.Context, accessToken string) ([]imap.FolderInfo, error) {
+// enumerateFoldersForOAuth picks the right folder/label discovery path based
+// on scope mode. Full-mode uses IMAP (which is the only thing that scope
+// authorizes that we can list folders with cheaply). Modify-mode uses the
+// Gmail labels API since IMAP isn't authorized.
+func (elp *EmailLoginProcess) enumerateFoldersForOAuth(ctx context.Context, svc *gmail.Service, accessToken string) ([]imap.FolderInfo, error) {
+	if elp.scopeMode == ScopeModeFull {
+		return elp.listFoldersOAuthIMAP(ctx, accessToken)
+	}
+	return ListGmailLabelsAsFolders(ctx, svc)
+}
+
+// listFoldersOAuthIMAP opens a one-shot IMAP connection authenticated via
+// XOAUTH2 for folder enumeration in full-scope mode.
+func (elp *EmailLoginProcess) listFoldersOAuthIMAP(ctx context.Context, accessToken string) ([]imap.FolderInfo, error) {
 	_ = ctx // Connect uses its own internal timeouts
 	logger := elp.connector.Bridge.Log.With().
 		Str("component", "login_test_oauth").

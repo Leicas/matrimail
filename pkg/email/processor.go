@@ -121,6 +121,20 @@ func (p *Processor) ProcessIMAPMessage(ctx context.Context, fetchData *imapclien
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse IMAP fetch data: %w", err)
 	}
+	return p.ProcessParsedEmail(ctx, parsedEmail, userLogin, mailbox)
+}
+
+// ProcessParsedEmail is the post-parse pipeline shared by the IMAP and Gmail
+// API ingestion paths: validation → sent-folder dedup → threading → portal-key
+// → attribution → EmailMessage assembly. Callers are responsible for
+// producing the ParsedEmail; this method handles everything downstream.
+//
+// Returns (nil, nil) — no error, no message to forward — when the message is
+// our own outbound echo and matches the sent-folder dedup table.
+func (p *Processor) ProcessParsedEmail(ctx context.Context, parsedEmail *ParsedEmail, userLogin *bridgev2.UserLogin, mailbox string) (*EmailMessage, error) {
+	if parsedEmail == nil {
+		return nil, fmt.Errorf("ProcessParsedEmail: nil parsedEmail")
+	}
 	// Guard against degraded parse that lacks basic identity/threading info
 	if strings.TrimSpace(parsedEmail.From) == "" {
 		return nil, fmt.Errorf("degraded parse: missing sender information")
@@ -147,11 +161,9 @@ func (p *Processor) ProcessIMAPMessage(ctx context.Context, fetchData *imapclien
 			Msg("Successfully parsed email message")
 	}
 
-	// Step 0: Sent-folder dedup. If the IMAP IDLE just echoed back a message
-	// we ourselves sent (recorded by HandleMatrixMessage in the connector),
-	// short-circuit before threading + portal work. Returning (nil, nil)
-	// signals "no error, nothing to forward"; the IMAP caller in
-	// pkg/imap/client.go must (and does, post-Phase B) tolerate that.
+	// Step 0: Sent-folder dedup. If we just received an echo of a message we
+	// ourselves sent (recorded by HandleMatrixMessage in the connector),
+	// short-circuit before threading + portal work.
 	if p.dedupChecker != nil && p.isOutboundMessage(mailbox) {
 		if hit, derr := p.dedupChecker.IsOurMessage(ctx, string(userLogin.ID), parsedEmail.MessageID); derr != nil {
 			p.log.Warn().Err(derr).Msg("Dedup check failed; falling through and processing message normally")
@@ -174,7 +186,6 @@ func (p *Processor) ProcessIMAPMessage(ctx context.Context, fetchData *imapclien
 	// Step 1: Determine thread membership (scoped by receiver)
 	receiver := string(userLogin.ID)
 	thread := p.threadManager.DetermineThread(receiver, parsedEmail)
-	// Cache thread under this receiver to enable room lookup later
 	p.threadManager.CacheForReceiver(receiver, thread)
 	if thread == nil {
 		return nil, fmt.Errorf("failed to determine thread for message %s", parsedEmail.MessageID)
@@ -189,10 +200,9 @@ func (p *Processor) ProcessIMAPMessage(ctx context.Context, fetchData *imapclien
 	// Step 3: Create network message ID
 	networkMessageID := networkid.MessageID(fmt.Sprintf("email:%s", parsedEmail.MessageID))
 
-	// Step 4: Check if this is an outbound message (sent by the bridge user)
+	// Step 4: Check if this is an outbound message
 	isOutbound := p.isOutboundMessage(mailbox)
 
-	// Attribution diagnostics
 	if p.sanitized {
 		p.log.Debug().
 			Str("mailbox", mailbox).
@@ -223,18 +233,16 @@ func (p *Processor) ProcessIMAPMessage(ctx context.Context, fetchData *imapclien
 			Str("thread_id", logging.HashHMAC(thread.ThreadID, p.secret, 10)).
 			Str("portal_key", logging.HashHMAC(string(portalKey.ID), p.secret, 10)).
 			Bool("is_outbound", isOutbound).
-			Msg("Successfully processed complete IMAP message")
+			Msg("Successfully processed complete email message")
 	} else {
 		p.log.Info().
 			Str("thread_id", thread.ThreadID).
 			Str("portal_key", string(portalKey.ID)).
 			Bool("is_outbound", isOutbound).
-			Msg("Successfully processed complete IMAP message")
+			Msg("Successfully processed complete email message")
 	}
 
-	// Add attachments to the email message (already extracted in parseIMAPFetchData)
 	emailMessage.Attachments = parsedEmail.Attachments
-
 	return emailMessage, nil
 }
 

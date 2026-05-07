@@ -26,14 +26,24 @@ import (
 
 // AuthType identifies which credential mechanism is in use for an email account.
 const (
-	AuthTypePassword   = "password"    // legacy: SMTP+IMAP via app password / normal password
-	AuthTypeOAuthGmail = "oauth-gmail" // Gmail / Workspace via Google OAuth (device flow)
+	AuthTypePassword              = "password"                  // legacy: SMTP+IMAP via app password / normal password
+	AuthTypeOAuthGmail            = "oauth-gmail"               // Gmail / Workspace via Google OAuth (auth code + PKCE + loopback)
+	AuthTypeOAuthGmailNeedsReauth = "oauth-gmail-needs-reauth"  // refresh token expired/revoked; user must run !matrimail login
 )
 
 // OAuthProvider identifiers persisted in EmailAccount.OAuthProvider.
 const (
 	OAuthProviderGoogle    = "google"
 	OAuthProviderMicrosoft = "microsoft" // reserved for v2; not yet emitted
+)
+
+// OAuth scope modes — controls whether the account uses Gmail-API-only access
+// (gmail.modify, sensitive scope, can be published without CASA) or full
+// IMAP/SMTP XOAUTH2 access (mail.google.com, restricted scope, locked into
+// Testing-mode publishing → 7-day refresh tokens).
+const (
+	ScopeModeModify = "modify" // Gmail API only; default; recommended
+	ScopeModeFull   = "full"   // mail.google.com; advanced/opt-in; required for IMAP
 )
 
 // EmailAccount represents a stored email account with credentials.
@@ -67,6 +77,16 @@ type EmailAccount struct {
 	OAuthRefreshToken string    `json:"oauth_refresh_token,omitempty"`
 	OAuthAccessToken  string    `json:"oauth_access_token,omitempty"`
 	OAuthExpiry       time.Time `json:"oauth_expiry,omitempty"`
+
+	// ScopeMode is "modify" (default; Gmail API only) or "full" (mail.google.com
+	// for IMAP+SMTP XOAUTH2). Set at login time by the user's choice; consulted
+	// by createIMAPClient and the Gmail API inbound poller to pick a transport.
+	ScopeMode string `json:"scope_mode,omitempty"`
+
+	// OAuthIssuedAt records when the current refresh token was minted. Used to
+	// warn the user at day 6 if their app is in Testing mode (7-day refresh-token
+	// expiry). Zero means unknown / pre-migration row.
+	OAuthIssuedAt time.Time `json:"oauth_issued_at,omitempty"`
 }
 
 // GetMonitoredFoldersJSON serializes MonitoredFolders to JSON for database storage
@@ -352,6 +372,10 @@ func (eaq *EmailAccountQuery) CreateTable(ctx context.Context) error {
 			oauth_refresh_token TEXT,
 			oauth_access_token TEXT,
 			oauth_expiry INTEGER,
+			scope_mode TEXT,
+			oauth_token_issued_at INTEGER,
+			oauth_history_id INTEGER,
+			last_reauth_notice_at INTEGER,
 			PRIMARY KEY (user_mxid, email)
 		)
 	`)
@@ -369,6 +393,11 @@ func (eaq *EmailAccountQuery) CreateTable(ctx context.Context) error {
 		`ALTER TABLE email_accounts ADD COLUMN oauth_refresh_token TEXT`,
 		`ALTER TABLE email_accounts ADD COLUMN oauth_access_token TEXT`,
 		`ALTER TABLE email_accounts ADD COLUMN oauth_expiry INTEGER`,
+		// New (auth-code rework):
+		`ALTER TABLE email_accounts ADD COLUMN scope_mode TEXT`,
+		`ALTER TABLE email_accounts ADD COLUMN oauth_token_issued_at INTEGER`,
+		`ALTER TABLE email_accounts ADD COLUMN oauth_history_id INTEGER`,
+		`ALTER TABLE email_accounts ADD COLUMN last_reauth_notice_at INTEGER`,
 	} {
 		_, _ = eaq.DB.Exec(ctx, stmt)
 	}
@@ -392,11 +421,28 @@ func (eaq *EmailAccountQuery) CreateTable(ctx context.Context) error {
 
 // SaveOAuthToken persists the OAuth refresh + access token for the given
 // account, encrypting both tokens at rest with the same AES-GCM key used for
-// passwords. Sets auth_type='oauth-gmail' and oauth_provider=provider.
+// passwords. Sets auth_type='oauth-gmail' and oauth_provider=provider, and
+// preserves any existing scope_mode (so token-refresh callers don't have to
+// re-pass it). Use SaveOAuthTokenWithScope at login time to set scope_mode.
 //
-// The account row must already exist (created by the IMAP login flow). This
-// method does NOT create the row — it updates it in place.
+// The account row must already exist (created by the login flow). This method
+// does NOT create the row — it updates it in place.
 func (eaq *EmailAccountQuery) SaveOAuthToken(ctx context.Context, userMXID, email, provider string, tok *oauth2.Token) error {
+	return eaq.saveOAuthTokenInternal(ctx, userMXID, email, provider, "", tok, false)
+}
+
+// SaveOAuthTokenWithScope is the login-time variant: it explicitly sets
+// scope_mode and stamps oauth_token_issued_at = now. Refresh-time callers
+// should use SaveOAuthToken (which preserves the existing scope_mode and does
+// not bump issued_at).
+func (eaq *EmailAccountQuery) SaveOAuthTokenWithScope(ctx context.Context, userMXID, email, provider, scopeMode string, tok *oauth2.Token) error {
+	if scopeMode == "" {
+		scopeMode = ScopeModeModify
+	}
+	return eaq.saveOAuthTokenInternal(ctx, userMXID, email, provider, scopeMode, tok, true)
+}
+
+func (eaq *EmailAccountQuery) saveOAuthTokenInternal(ctx context.Context, userMXID, email, provider, scopeMode string, tok *oauth2.Token, stampIssuedAt bool) error {
 	if tok == nil {
 		return errors.New("SaveOAuthToken: nil token")
 	}
@@ -419,11 +465,29 @@ func (eaq *EmailAccountQuery) SaveOAuthToken(ctx context.Context, userMXID, emai
 	}
 
 	authType := AuthTypeOAuthGmail
-	res, err := eaq.DB.Exec(ctx, dialectQuery(eaq.DB.Dialect, `
-		UPDATE email_accounts
-		SET auth_type = ?, oauth_provider = ?, oauth_refresh_token = ?, oauth_access_token = ?, oauth_expiry = ?
-		WHERE user_mxid = ? AND email = ?
-	`), authType, provider, encRefresh, encAccess, expiryNanos, userMXID, email)
+	var (
+		res sql.Result
+	)
+	if scopeMode != "" {
+		// Login-time path: set scope_mode + issued_at.
+		issuedAt := int64(0)
+		if stampIssuedAt {
+			issuedAt = time.Now().UnixNano()
+		}
+		res, err = eaq.DB.Exec(ctx, dialectQuery(eaq.DB.Dialect, `
+			UPDATE email_accounts
+			SET auth_type = ?, oauth_provider = ?, oauth_refresh_token = ?, oauth_access_token = ?, oauth_expiry = ?,
+			    scope_mode = ?, oauth_token_issued_at = ?, last_reauth_notice_at = 0
+			WHERE user_mxid = ? AND email = ?
+		`), authType, provider, encRefresh, encAccess, expiryNanos, scopeMode, issuedAt, userMXID, email)
+	} else {
+		// Refresh-time path: leave scope_mode + issued_at untouched.
+		res, err = eaq.DB.Exec(ctx, dialectQuery(eaq.DB.Dialect, `
+			UPDATE email_accounts
+			SET auth_type = ?, oauth_provider = ?, oauth_refresh_token = ?, oauth_access_token = ?, oauth_expiry = ?
+			WHERE user_mxid = ? AND email = ?
+		`), authType, provider, encRefresh, encAccess, expiryNanos, userMXID, email)
+	}
 	if err != nil {
 		return err
 	}
@@ -433,44 +497,161 @@ func (eaq *EmailAccountQuery) SaveOAuthToken(ctx context.Context, userMXID, emai
 	return nil
 }
 
+// SetAuthType updates only the auth_type column. Used by the re-auth path to
+// flip an account into AuthTypeOAuthGmailNeedsReauth (and back to
+// AuthTypeOAuthGmail when the user re-logs in).
+func (eaq *EmailAccountQuery) SetAuthType(ctx context.Context, userMXID, email, authType string) error {
+	_, err := eaq.DB.Exec(ctx, dialectQuery(eaq.DB.Dialect, `
+		UPDATE email_accounts SET auth_type = ? WHERE user_mxid = ? AND email = ?
+	`), authType, userMXID, email)
+	return err
+}
+
+// MarkReauthNotified records that we sent a re-auth DM at the given time, used
+// to debounce repeat notifications. Returns whether the timestamp was actually
+// stored (i.e. the row exists).
+func (eaq *EmailAccountQuery) MarkReauthNotified(ctx context.Context, userMXID, email string, at time.Time) error {
+	_, err := eaq.DB.Exec(ctx, dialectQuery(eaq.DB.Dialect, `
+		UPDATE email_accounts SET last_reauth_notice_at = ? WHERE user_mxid = ? AND email = ?
+	`), at.UnixNano(), userMXID, email)
+	return err
+}
+
+// LastReauthNotifiedAt returns when (if ever) we last sent a re-auth DM for
+// this account. Zero time means never (or the account has been reset).
+func (eaq *EmailAccountQuery) LastReauthNotifiedAt(ctx context.Context, userMXID, email string) (time.Time, error) {
+	rows, err := eaq.DB.Query(ctx, dialectQuery(eaq.DB.Dialect, `
+		SELECT COALESCE(last_reauth_notice_at, 0) FROM email_accounts WHERE user_mxid = ? AND email = ?
+	`), userMXID, email)
+	if err != nil {
+		return time.Time{}, err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return time.Time{}, rows.Err()
+	}
+	var nanos sql.NullInt64
+	if err := rows.Scan(&nanos); err != nil {
+		return time.Time{}, err
+	}
+	if !nanos.Valid || nanos.Int64 == 0 {
+		return time.Time{}, nil
+	}
+	return time.Unix(0, nanos.Int64), nil
+}
+
+// GetGmailHistoryID / SetGmailHistoryID persist the Gmail API users.history.list
+// cursor for accounts using ScopeModeModify. Zero means "no cursor yet — sync
+// from the current historyId on first poll".
+func (eaq *EmailAccountQuery) GetGmailHistoryID(ctx context.Context, userMXID, email string) (uint64, error) {
+	rows, err := eaq.DB.Query(ctx, dialectQuery(eaq.DB.Dialect, `
+		SELECT COALESCE(oauth_history_id, 0) FROM email_accounts WHERE user_mxid = ? AND email = ?
+	`), userMXID, email)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return 0, rows.Err()
+	}
+	var raw sql.NullInt64
+	if err := rows.Scan(&raw); err != nil {
+		return 0, err
+	}
+	if !raw.Valid || raw.Int64 < 0 {
+		return 0, nil
+	}
+	return uint64(raw.Int64), nil
+}
+
+func (eaq *EmailAccountQuery) SetGmailHistoryID(ctx context.Context, userMXID, email string, historyID uint64) error {
+	_, err := eaq.DB.Exec(ctx, dialectQuery(eaq.DB.Dialect, `
+		UPDATE email_accounts SET oauth_history_id = ? WHERE user_mxid = ? AND email = ?
+	`), int64(historyID), userMXID, email)
+	return err
+}
+
 // LoadOAuthToken returns the saved OAuth token for the account. If the account
-// is not in OAuth mode (auth_type != "oauth-gmail") it returns ("", nil, nil)
-// so callers can fall back to the password path.
+// is not in OAuth mode (auth_type != "oauth-gmail" / "oauth-gmail-needs-reauth")
+// it returns ("", nil, nil) so callers can fall back to the password path.
+//
+// Both AuthTypeOAuthGmail and AuthTypeOAuthGmailNeedsReauth return the token
+// (the refresh token may still be valid even if a previous attempt failed —
+// e.g. transient network errors flagged the row but the user hasn't run
+// !matrimail login yet). Callers responsible for connection setup should
+// inspect the auth_type via GetOAuthAccount and skip connecting if it's
+// flagged for re-auth.
 func (eaq *EmailAccountQuery) LoadOAuthToken(ctx context.Context, userMXID, email string) (string, *oauth2.Token, error) {
+	info, err := eaq.GetOAuthAccount(ctx, userMXID, email)
+	if err != nil || info == nil {
+		return "", nil, err
+	}
+	return info.Provider, info.Token, nil
+}
+
+// OAuthAccountInfo bundles everything LoadOAuthToken returns plus the auth
+// state and scope mode. Callers that need to make routing decisions
+// (Gmail-API vs IMAP, skip-because-needs-reauth) should use this instead of
+// LoadOAuthToken.
+type OAuthAccountInfo struct {
+	AuthType  string        // AuthTypeOAuthGmail or AuthTypeOAuthGmailNeedsReauth
+	Provider  string        // OAuthProviderGoogle, etc.
+	ScopeMode string        // ScopeModeModify | ScopeModeFull
+	Token     *oauth2.Token // nil if no refresh token stored
+	IssuedAt  time.Time     // when the current refresh token was minted; zero if unknown
+}
+
+// GetOAuthAccount returns nil, nil when the account is not in OAuth mode (so
+// callers can fall through to the password path). Returns a non-nil
+// *OAuthAccountInfo for both AuthTypeOAuthGmail and AuthTypeOAuthGmailNeedsReauth.
+func (eaq *EmailAccountQuery) GetOAuthAccount(ctx context.Context, userMXID, email string) (*OAuthAccountInfo, error) {
 	rows, err := eaq.DB.Query(ctx, dialectQuery(eaq.DB.Dialect, `
 		SELECT auth_type, COALESCE(oauth_provider, ''), COALESCE(oauth_refresh_token, ''),
-		       COALESCE(oauth_access_token, ''), COALESCE(oauth_expiry, 0)
+		       COALESCE(oauth_access_token, ''), COALESCE(oauth_expiry, 0),
+		       COALESCE(scope_mode, ''), COALESCE(oauth_token_issued_at, 0)
 		FROM email_accounts
 		WHERE user_mxid = ? AND email = ?
 	`), userMXID, email)
 	if err != nil {
-		return "", nil, err
+		return nil, err
 	}
 	defer rows.Close()
 
 	if !rows.Next() {
 		if rerr := rows.Err(); rerr != nil {
-			return "", nil, rerr
+			return nil, rerr
 		}
-		return "", nil, nil
+		return nil, nil
 	}
 
-	var authType, provider, encRefresh, encAccess string
-	var expiryNanos sql.NullInt64
-	if err := rows.Scan(&authType, &provider, &encRefresh, &encAccess, &expiryNanos); err != nil {
-		return "", nil, err
+	var authType, provider, encRefresh, encAccess, scopeMode string
+	var expiryNanos, issuedAtNanos sql.NullInt64
+	if err := rows.Scan(&authType, &provider, &encRefresh, &encAccess, &expiryNanos, &scopeMode, &issuedAtNanos); err != nil {
+		return nil, err
 	}
 
-	if authType != AuthTypeOAuthGmail {
-		return "", nil, nil
+	if authType != AuthTypeOAuthGmail && authType != AuthTypeOAuthGmailNeedsReauth {
+		return nil, nil
+	}
+	info := &OAuthAccountInfo{AuthType: authType, Provider: provider, ScopeMode: scopeMode}
+	if info.ScopeMode == "" {
+		// Pre-migration rows or rows from before scope_mode existed: assume
+		// the legacy "full" mode (mail.google.com via XOAUTH2). New OAuth
+		// logins always set scope_mode explicitly via SaveOAuthTokenWithScope.
+		info.ScopeMode = ScopeModeFull
+	}
+	if issuedAtNanos.Valid && issuedAtNanos.Int64 > 0 {
+		info.IssuedAt = time.Unix(0, issuedAtNanos.Int64)
 	}
 	if encRefresh == "" {
-		return provider, nil, errors.New("LoadOAuthToken: account is oauth-gmail but has no refresh token stored")
+		// Flagged for re-auth and the refresh token has already been wiped —
+		// the row is just a placeholder. Return the info shell with no token.
+		return info, nil
 	}
 
 	refresh, err := decryptString(encRefresh)
 	if err != nil {
-		return provider, nil, fmt.Errorf("decrypt refresh token: %w", err)
+		return info, fmt.Errorf("decrypt refresh token: %w", err)
 	}
 	var access string
 	if encAccess != "" {
@@ -482,15 +663,15 @@ func (eaq *EmailAccountQuery) LoadOAuthToken(ctx context.Context, userMXID, emai
 		}
 	}
 
-	tok := &oauth2.Token{
+	info.Token = &oauth2.Token{
 		AccessToken:  access,
 		RefreshToken: refresh,
 		TokenType:    "Bearer",
 	}
 	if expiryNanos.Valid && expiryNanos.Int64 > 0 {
-		tok.Expiry = time.Unix(0, expiryNanos.Int64)
+		info.Token.Expiry = time.Unix(0, expiryNanos.Int64)
 	}
-	return provider, tok, nil
+	return info, nil
 }
 
 func (eaq *EmailAccountQuery) GetAccount(ctx context.Context, userMXID, email string) (*EmailAccount, error) {

@@ -2,6 +2,7 @@ package connector
 
 import (
 	_ "embed"
+	"time"
 
 	up "go.mau.fi/util/configupgrade"
 )
@@ -26,6 +27,54 @@ type Config struct {
 type GmailOAuthConfig struct {
 	ClientID     string `yaml:"client_id"`
 	ClientSecret string `yaml:"client_secret"`
+
+	// ListenerAddress overrides the address the loopback OAuth callback server
+	// binds to. Default "127.0.0.1:0" (random ephemeral port). Override only if
+	// the user has a fixed SSH-tunnel port configured. The ":0" suffix means
+	// the OS picks a free port — recommended.
+	ListenerAddress string `yaml:"listener_address"`
+
+	// DefaultScopeMode is "modify" (recommended; Gmail API only, sensitive
+	// scope) or "full" (mail.google.com; restricted scope; required for IMAP
+	// XOAUTH2 + SMTP). Per-login overridable; this is just the default the
+	// login UI presents.
+	DefaultScopeMode string `yaml:"default_scope_mode"`
+
+	// CallbackTimeoutSeconds bounds how long the loopback listener waits for
+	// the user's browser callback. Default 600 (10 minutes). Past this the
+	// listener shuts down and the login flow errors with "authorization timed
+	// out, run !matrimail login again".
+	CallbackTimeoutSeconds int `yaml:"callback_timeout_seconds"`
+}
+
+// EffectiveListenerAddress returns the configured loopback bind address with
+// the safe default applied. Callers should always go through this to ensure
+// we never accidentally bind to 0.0.0.0 from a typo'd config.
+func (g GmailOAuthConfig) EffectiveListenerAddress() string {
+	if g.ListenerAddress == "" {
+		return "127.0.0.1:0"
+	}
+	return g.ListenerAddress
+}
+
+// EffectiveDefaultScopeMode returns "modify" unless the operator has set
+// "full" in config. Empty / unrecognised values fall back to "modify".
+func (g GmailOAuthConfig) EffectiveDefaultScopeMode() string {
+	switch g.DefaultScopeMode {
+	case ScopeModeFull, ScopeModeModify:
+		return g.DefaultScopeMode
+	default:
+		return ScopeModeModify
+	}
+}
+
+// EffectiveCallbackTimeout returns the OAuth callback timeout, defaulting to
+// 10 minutes when unset.
+func (g GmailOAuthConfig) EffectiveCallbackTimeout() time.Duration {
+	if g.CallbackTimeoutSeconds <= 0 {
+		return 10 * time.Minute
+	}
+	return time.Duration(g.CallbackTimeoutSeconds) * time.Second
 }
 
 type NetworkConfig struct {
@@ -75,9 +124,13 @@ func upgradeConfig(helper up.Helper) {
 	helper.Copy(up.Bool, "logging", "sanitized")
 	helper.Copy(up.Str, "logging", "pseudonym_secret")
 
-	// Gmail OAuth (Desktop app client credentials for the device-code flow).
+	// Gmail OAuth (Desktop app client credentials for the auth-code + PKCE
+	// + loopback flow).
 	helper.Copy(up.Str, "gmail_oauth", "client_id")
 	helper.Copy(up.Str, "gmail_oauth", "client_secret")
+	helper.Copy(up.Str, "gmail_oauth", "listener_address")
+	helper.Copy(up.Str, "gmail_oauth", "default_scope_mode")
+	helper.Copy(up.Int, "gmail_oauth", "callback_timeout_seconds")
 }
 
 func (ec *EmailConnector) GetConfig() (string, any, up.Upgrader) {
