@@ -2,7 +2,9 @@ package email
 
 import (
 	"context"
+	"net"
 	"strings"
+	"time"
 
 	"github.com/rs/zerolog"
 	"golang.org/x/oauth2"
@@ -40,6 +42,12 @@ var smtpProviders = map[string]SMTPProviderInfo{
 // SMTPInfoForEmail returns the SMTP submission endpoint for the given email.
 // Falls back to smtp.<domain>:587 STARTTLS for unknown providers. Returns the
 // zero value SMTPProviderInfo for malformed addresses.
+//
+// Google Workspace custom domains (e.g. an org's @company.com that uses Google
+// for mail) aren't detectable from the address alone — caller should pass the
+// MX-detection result via IsGoogleWorkspace to override the fallback. The IMAP
+// client does this; outbound paths that don't have an MX-detection hook will
+// silently fall back to smtp.<domain> which is wrong for Workspace accounts.
 func SMTPInfoForEmail(email string) SMTPProviderInfo {
 	parts := strings.SplitN(strings.ToLower(strings.TrimSpace(email)), "@", 2)
 	if len(parts) != 2 || parts[1] == "" {
@@ -49,6 +57,41 @@ func SMTPInfoForEmail(email string) SMTPProviderInfo {
 		return p
 	}
 	return SMTPProviderInfo{Host: "smtp." + parts[1], Port: 587, StartTLS: true}
+}
+
+// SMTPInfoForGoogleWorkspace returns Gmail's SMTP submission endpoint for any
+// domain that's confirmed (via MX lookup) to be Google Workspace-hosted. The
+// caller is responsible for confirming the domain is Google-hosted; this helper
+// just returns the canonical Gmail SMTP endpoint.
+func SMTPInfoForGoogleWorkspace() SMTPProviderInfo {
+	return SMTPProviderInfo{Host: "smtp.gmail.com", Port: 587, StartTLS: true}
+}
+
+// IsGoogleWorkspaceDomain reports whether the given domain's MX records point
+// to Google Workspace mail servers. Returns false on any DNS failure or if no
+// MX records are Google-shaped — caller should fall back to default behavior.
+//
+// Google Workspace MX patterns (as of 2025):
+//   - aspmx.l.google.com
+//   - alt1.aspmx.l.google.com .. alt4.aspmx.l.google.com
+//   - smtp.google.com (newer)
+//   - googlemail.l.google.com (legacy)
+// All canonical hostnames end with ".google.com" after MX resolution.
+func IsGoogleWorkspaceDomain(domain string) bool {
+	resolver := &net.Resolver{}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	mxs, err := resolver.LookupMX(ctx, domain)
+	if err != nil || len(mxs) == 0 {
+		return false
+	}
+	for _, mx := range mxs {
+		host := strings.ToLower(strings.TrimSuffix(mx.Host, "."))
+		if strings.HasSuffix(host, ".google.com") || strings.HasSuffix(host, ".googlemail.com") {
+			return true
+		}
+	}
+	return false
 }
 
 // IsGmailDomain reports whether the address is a regular Gmail consumer
@@ -69,10 +112,11 @@ func IsGmailDomain(emailAddr string) bool {
 // populates it from EmailAccount + decrypted OAuth tokens at sender-construction
 // time.
 type SenderAccount struct {
-	Email            string             // user's primary email address (used as SMTP username and SASL identity)
-	IsGmail          bool               // true for gmail.com / googlemail.com / Workspace accounts authorized via OAuth
-	AppPassword      string             // SMTP path: app password or normal password used with PLAIN auth
-	OAuthTokenSource oauth2.TokenSource // Gmail API path; nil when the account is SMTP-only
+	Email              string             // user's primary email address (used as SMTP username and SASL identity)
+	IsGmail            bool               // true for gmail.com / googlemail.com / Workspace accounts authorized via OAuth
+	IsGoogleWorkspace  bool               // true when the domain's MX records point to Google — forces SMTP host to smtp.gmail.com regardless of domain
+	AppPassword        string             // SMTP path: app password or normal password used with PLAIN auth
+	OAuthTokenSource   oauth2.TokenSource // Gmail API path; nil when the account is SMTP-only
 }
 
 // PickSender decides which Sender impl to use for a given account.
@@ -91,7 +135,14 @@ func PickSender(_ context.Context, account SenderAccount, log *zerolog.Logger) (
 	if account.OAuthTokenSource != nil && account.IsGmail {
 		return NewGmailAPISender(account.OAuthTokenSource, log), nil
 	}
-	info := SMTPInfoForEmail(account.Email)
+	var info SMTPProviderInfo
+	if account.IsGoogleWorkspace {
+		// Workspace custom domain (e.g. user@company.com hosted on Google) — IMAP+SMTP
+		// live at gmail.com regardless of the user's domain.
+		info = SMTPInfoForGoogleWorkspace()
+	} else {
+		info = SMTPInfoForEmail(account.Email)
+	}
 	return NewSMTPSender(SMTPConfig{
 		Host:       info.Host,
 		Port:       info.Port,

@@ -331,6 +331,16 @@ func (ec *EmailConnector) buildSender(ctx context.Context, emailClient *EmailCli
 		IsGmail:     email.IsGmailDomain(emailClient.Email),
 		AppPassword: emailClient.Password,
 	}
+	// Detect Google Workspace custom domains (e.g. user@company.com hosted on
+	// Google) via MX lookup so the SMTP path uses smtp.gmail.com instead of
+	// smtp.<custom-domain> which doesn't exist.
+	if !senderAccount.IsGmail {
+		if at := strings.LastIndex(emailClient.Email, "@"); at >= 0 {
+			if email.IsGoogleWorkspaceDomain(emailClient.Email[at+1:]) {
+				senderAccount.IsGoogleWorkspace = true
+			}
+		}
+	}
 
 	if account.AuthType == AuthTypeOAuthGmail {
 		// OAuth path — load token and build a refresh-aware TokenSource.

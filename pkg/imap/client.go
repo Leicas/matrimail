@@ -19,7 +19,7 @@ import (
 
 	"github.com/Leicas/matrimail/pkg/common"
 	"github.com/Leicas/matrimail/pkg/coordinator"
-	"github.com/Leicas/matrimail/pkg/email"
+	emailpkg "github.com/Leicas/matrimail/pkg/email"
 	logging "github.com/Leicas/matrimail/pkg/logging"
 	"github.com/Leicas/matrimail/pkg/reliability"
 )
@@ -180,7 +180,7 @@ type Client struct {
 	// Bridge integration
 	login            *bridgev2.UserLogin // Can be nil for testing
 	log              *zerolog.Logger
-	processor        *email.Processor
+	processor        *emailpkg.Processor
 	stateCoordinator StateCoordinator // Interface for reporting state events
 
 	// Threading
@@ -384,6 +384,13 @@ func NewClient(email, username, password string, login *bridgev2.UserLogin, log 
 		useTLS = provider.TLS
 		// SECURE LOGGING: No passwords logged
 		log.Info().Str("provider", provider.Name).Str("host", host).Int("port", port).Str("email", email).Msg("Auto-detected email provider")
+	} else if emailpkg.IsGoogleWorkspaceDomain(domain) {
+		// Google Workspace custom domain (e.g. haply.co with MX → aspmx.l.google.com).
+		// IMAP still lives at imap.gmail.com — the email's domain is irrelevant for IMAP.
+		host = "imap.gmail.com"
+		port = 993
+		useTLS = true
+		log.Info().Str("domain", domain).Str("email", email).Msg("Detected Google Workspace via MX records — using imap.gmail.com")
 	} else {
 		// Default IMAP settings for unknown providers
 		host = fmt.Sprintf("imap.%s", domain)
@@ -1255,7 +1262,7 @@ func (c *Client) checkNewMessagesFor(cli *imapclient.Client, mailbox string, isS
 }
 
 // SetProcessor sets the email processor for this client
-func (c *Client) SetProcessor(processor *email.Processor) {
+func (c *Client) SetProcessor(processor *emailpkg.Processor) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.processor = processor
