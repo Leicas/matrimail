@@ -64,7 +64,7 @@ func (r *DBThreadMetadataResolver) ResolveThreadID(receiver, messageID string) (
 		LIMIT 1`
 		
 	for _, rid := range candidates {
-		if result := r.queryUnionResult(ctx, unionQuery, r.Network, rid, receiver, r.Network, rid, r.Network, rid, receiver, r.Network, rid); result != "" {
+		if result := r.queryUnionResult(ctx, dialectQuery(r.Bridge.DB.Dialect, unionQuery), r.Network, rid, receiver, r.Network, rid, r.Network, rid, receiver, r.Network, rid); result != "" {
 			ntid := normalizeThreadID(result)
 			if r.Log != nil {
 				r.Log.Debug().Str("receiver", receiver).Str("remote_id", rid).Str("thread_id", ntid).Msg("DB resolver: resolved email message to thread")

@@ -419,11 +419,11 @@ func (eaq *EmailAccountQuery) SaveOAuthToken(ctx context.Context, userMXID, emai
 	}
 
 	authType := AuthTypeOAuthGmail
-	res, err := eaq.DB.Exec(ctx, `
+	res, err := eaq.DB.Exec(ctx, dialectQuery(eaq.DB.Dialect, `
 		UPDATE email_accounts
 		SET auth_type = ?, oauth_provider = ?, oauth_refresh_token = ?, oauth_access_token = ?, oauth_expiry = ?
 		WHERE user_mxid = ? AND email = ?
-	`, authType, provider, encRefresh, encAccess, expiryNanos, userMXID, email)
+	`), authType, provider, encRefresh, encAccess, expiryNanos, userMXID, email)
 	if err != nil {
 		return err
 	}
@@ -437,12 +437,12 @@ func (eaq *EmailAccountQuery) SaveOAuthToken(ctx context.Context, userMXID, emai
 // is not in OAuth mode (auth_type != "oauth-gmail") it returns ("", nil, nil)
 // so callers can fall back to the password path.
 func (eaq *EmailAccountQuery) LoadOAuthToken(ctx context.Context, userMXID, email string) (string, *oauth2.Token, error) {
-	rows, err := eaq.DB.Query(ctx, `
+	rows, err := eaq.DB.Query(ctx, dialectQuery(eaq.DB.Dialect, `
 		SELECT auth_type, COALESCE(oauth_provider, ''), COALESCE(oauth_refresh_token, ''),
 		       COALESCE(oauth_access_token, ''), COALESCE(oauth_expiry, 0)
 		FROM email_accounts
 		WHERE user_mxid = ? AND email = ?
-	`, userMXID, email)
+	`), userMXID, email)
 	if err != nil {
 		return "", nil, err
 	}
@@ -495,11 +495,11 @@ func (eaq *EmailAccountQuery) LoadOAuthToken(ctx context.Context, userMXID, emai
 
 func (eaq *EmailAccountQuery) GetAccount(ctx context.Context, userMXID, email string) (*EmailAccount, error) {
 	account := &EmailAccount{}
-	rows, err := eaq.DB.Query(ctx, `
+	rows, err := eaq.DB.Query(ctx, dialectQuery(eaq.DB.Dialect, `
 		SELECT user_mxid, email, username, password, host, port, tls, created_at, last_sync_time, COALESCE(monitored_folders, '["INBOX"]')
 		FROM email_accounts
 		WHERE user_mxid = ? AND email = ?
-	`, userMXID, email)
+	`), userMXID, email)
 	if err != nil {
 		return nil, err
 	}
@@ -534,12 +534,12 @@ func (eaq *EmailAccountQuery) GetAccount(ctx context.Context, userMXID, email st
 }
 
 func (eaq *EmailAccountQuery) GetUserAccounts(ctx context.Context, userMXID string) ([]*EmailAccount, error) {
-	rows, err := eaq.DB.Query(ctx, `
+	rows, err := eaq.DB.Query(ctx, dialectQuery(eaq.DB.Dialect, `
 		SELECT user_mxid, email, username, password, host, port, tls, created_at, last_sync_time, COALESCE(monitored_folders, '["INBOX"]')
 		FROM email_accounts
 		WHERE user_mxid = ?
 		ORDER BY created_at ASC
-	`, userMXID)
+	`), userMXID)
 	if err != nil {
 		return nil, err
 	}
@@ -571,12 +571,12 @@ func (eaq *EmailAccountQuery) GetUserAccounts(ctx context.Context, userMXID stri
 
 // GetUserAccountsBasic returns user accounts without decrypting passwords (for display/status)
 func (eaq *EmailAccountQuery) GetUserAccountsBasic(ctx context.Context, userMXID string) ([]*EmailAccount, error) {
-	rows, err := eaq.DB.Query(ctx, `
+	rows, err := eaq.DB.Query(ctx, dialectQuery(eaq.DB.Dialect, `
 		SELECT user_mxid, email, username, host, port, tls, created_at, last_sync_time, COALESCE(monitored_folders, '["INBOX"]')
 		FROM email_accounts
 		WHERE user_mxid = ?
 		ORDER BY created_at ASC
-	`, userMXID)
+	`), userMXID)
 	if err != nil {
 		return nil, err
 	}
@@ -607,30 +607,41 @@ func (eaq *EmailAccountQuery) UpsertAccount(ctx context.Context, account *EmailA
 	if err != nil {
 		return fmt.Errorf("failed to encrypt password: %w", err)
 	}
-	_, err = eaq.DB.Exec(ctx, `
-		INSERT OR REPLACE INTO email_accounts 
+	// ON CONFLICT DO UPDATE works on both SQLite 3.24+ and Postgres 9.5+.
+	// Note: this UPSERT only touches the password-flow columns; auth_type and
+	// oauth_* columns are managed separately via SaveOAuthToken/UpdateMonitoredFolders.
+	_, err = eaq.DB.Exec(ctx, dialectQuery(eaq.DB.Dialect, `
+		INSERT INTO email_accounts
 		(user_mxid, email, username, password, host, port, tls, created_at, last_sync_time, monitored_folders)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, account.UserMXID, account.Email, account.Username, enc,
+		ON CONFLICT (user_mxid, email) DO UPDATE SET
+			username = EXCLUDED.username,
+			password = EXCLUDED.password,
+			host = EXCLUDED.host,
+			port = EXCLUDED.port,
+			tls = EXCLUDED.tls,
+			last_sync_time = EXCLUDED.last_sync_time,
+			monitored_folders = EXCLUDED.monitored_folders
+	`), account.UserMXID, account.Email, account.Username, enc,
 		account.Host, account.Port, account.TLS, account.CreatedAt, account.LastSyncTime,
 		account.GetMonitoredFoldersJSON())
 	return err
 }
 
 func (eaq *EmailAccountQuery) DeleteAccount(ctx context.Context, userMXID, email string) error {
-	_, err := eaq.DB.Exec(ctx, `
+	_, err := eaq.DB.Exec(ctx, dialectQuery(eaq.DB.Dialect, `
 		DELETE FROM email_accounts
 		WHERE user_mxid = ? AND email = ?
-	`, userMXID, email)
+	`), userMXID, email)
 	return err
 }
 
 func (eaq *EmailAccountQuery) UpdateLastSync(ctx context.Context, userMXID, email string, syncTime time.Time) error {
-	_, err := eaq.DB.Exec(ctx, `
+	_, err := eaq.DB.Exec(ctx, dialectQuery(eaq.DB.Dialect, `
 		UPDATE email_accounts
 		SET last_sync_time = ?
 		WHERE user_mxid = ? AND email = ?
-	`, syncTime, userMXID, email)
+	`), syncTime, userMXID, email)
 	return err
 }
 
@@ -640,10 +651,10 @@ func (eaq *EmailAccountQuery) UpdateLastSync(ctx context.Context, userMXID, emai
 // the OAuth login flow's completeLogin step.
 func (eaq *EmailAccountQuery) UpdateMonitoredFolders(ctx context.Context, userMXID, email string, folders []string) error {
 	tmp := &EmailAccount{MonitoredFolders: folders}
-	_, err := eaq.DB.Exec(ctx, `
+	_, err := eaq.DB.Exec(ctx, dialectQuery(eaq.DB.Dialect, `
 		UPDATE email_accounts
 		SET monitored_folders = ?
 		WHERE user_mxid = ? AND email = ?
-	`, tmp.GetMonitoredFoldersJSON(), userMXID, email)
+	`), tmp.GetMonitoredFoldersJSON(), userMXID, email)
 	return err
 }
