@@ -30,7 +30,9 @@ RUN apt-get update -y \
 # Stage the libolm shared object under an arch-agnostic path so the COPY in
 # the final stage doesn't need to know the target arch.
 RUN mkdir -p /matrimail-runtime/lib /matrimail-runtime/etc/ssl/certs /matrimail-runtime/usr/share \
-    && cp -L "$(find /usr/lib -name libolm.so.3 -type f | head -n1)" /matrimail-runtime/lib/libolm.so.3 \
+    && libolm_path="$(find /usr/lib -name 'libolm.so.3*' \( -type f -o -type l \) | head -n1)" \
+    && test -n "$libolm_path" || (echo "libolm.so.3 not found under /usr/lib"; ls -lR /usr/lib | grep -i olm; exit 1) \
+    && cp -L "$libolm_path" /matrimail-runtime/lib/libolm.so.3 \
     && cp /etc/ssl/certs/ca-certificates.crt /matrimail-runtime/etc/ssl/certs/ca-certificates.crt \
     && cp -r /usr/share/zoneinfo /matrimail-runtime/usr/share/zoneinfo
 
