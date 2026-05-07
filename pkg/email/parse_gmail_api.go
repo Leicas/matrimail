@@ -102,7 +102,7 @@ func walkGmailPayload(part *gmail.MessagePart, out *ParsedEmail) {
 		out.Attachments = append(out.Attachments, &EmailAttachment{
 			Filename:    part.Filename,
 			ContentType: part.MimeType,
-			Size:        int(part.Body.Size),
+			Size:        part.Body.Size,
 		})
 	case strings.HasPrefix(mimeType, "multipart/"):
 		for _, child := range part.Parts {

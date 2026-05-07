@@ -952,7 +952,7 @@ prompt from Step 1.`,
 			scopeNote,
 		),
 		DisplayAndWaitParams: &bridgev2.LoginDisplayAndWaitParams{
-			Type: bridgev2.LoginDisplayTypeURL,
+			Type: bridgev2.LoginDisplayTypeCode,
 			Data: authURL,
 		},
 	}, nil
@@ -1002,7 +1002,7 @@ func (elp *EmailLoginProcess) handleOAuthWait(ctx context.Context, _ map[string]
 			StepID:       "oauth_wait",
 			Instructions: "⏳ Still waiting for you to authorize in your browser. Open the URL from the previous message and finish the OAuth flow.",
 			DisplayAndWaitParams: &bridgev2.LoginDisplayAndWaitParams{
-				Type: bridgev2.LoginDisplayTypeURL,
+				Type: bridgev2.LoginDisplayTypeCode,
 				Data: elp.listener.RedirectURI(),
 			},
 		}, nil
