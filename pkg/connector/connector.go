@@ -506,7 +506,9 @@ func (ec *EmailConnector) checkDBWritable(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to create health check table: %w", err)
 	}
-	_, err = ec.Bridge.DB.Exec(ctx, `INSERT INTO email_health_check (ts) VALUES (?)`, time.Now().Unix())
+	// Inline the value to avoid placeholder dialect differences (SQLite uses ?, Postgres uses $1).
+	// The row is deleted immediately below; the actual value doesn't matter — this only verifies write access.
+	_, err = ec.Bridge.DB.Exec(ctx, `INSERT INTO email_health_check (ts) VALUES (0)`)
 	if err != nil {
 		return fmt.Errorf("failed to insert into health check table: %w", err)
 	}
