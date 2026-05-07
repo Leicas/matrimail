@@ -11,11 +11,21 @@ var ExampleConfig string
 
 type Config struct {
 	// Top-level blocks to match example-config.yaml structure
-	IMAP       IMAPConfig        `yaml:"imap"`
-	Logging    LoggingConfig     `yaml:"logging"`
-	Processing ProcessingConfig  `yaml:"email_processing"`
+	IMAP       IMAPConfig       `yaml:"imap"`
+	Logging    LoggingConfig    `yaml:"logging"`
+	Processing ProcessingConfig `yaml:"email_processing"`
+	// GmailOAuth holds the user-provided "Desktop app" OAuth 2.0 client
+	// credentials used for the device-code login flow on Gmail accounts.
+	GmailOAuth GmailOAuthConfig `yaml:"gmail_oauth"`
 	// Keep Network for internal use but don't map to YAML
-	Network    NetworkConfig     `yaml:"-"`
+	Network NetworkConfig `yaml:"-"`
+}
+
+// GmailOAuthConfig is the on-disk shape of the gmail_oauth: block. The
+// runtime variant lives in pkg/email; this type only carries the YAML.
+type GmailOAuthConfig struct {
+	ClientID     string `yaml:"client_id"`
+	ClientSecret string `yaml:"client_secret"`
 }
 
 type NetworkConfig struct {
@@ -64,6 +74,10 @@ func upgradeConfig(helper up.Helper) {
 	// Logging configuration
 	helper.Copy(up.Bool, "logging", "sanitized")
 	helper.Copy(up.Str, "logging", "pseudonym_secret")
+
+	// Gmail OAuth (Desktop app client credentials for the device-code flow).
+	helper.Copy(up.Str, "gmail_oauth", "client_id")
+	helper.Copy(up.Str, "gmail_oauth", "client_secret")
 }
 
 func (ec *EmailConnector) GetConfig() (string, any, up.Upgrader) {

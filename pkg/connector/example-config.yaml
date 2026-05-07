@@ -22,3 +22,11 @@ email_processing:
     max_upload_bytes: 26214400
     # Attempt gzip for oversized original HTML/text bodies before attaching
     gzip_large_bodies: true
+
+# Gmail OAuth — required if you want to connect Gmail accounts via OAuth (recommended).
+# Create a "Desktop app" OAuth 2.0 Client at https://console.cloud.google.com/apis/credentials
+# and paste the client_id + client_secret here. Without these, Gmail accounts can still
+# connect via the legacy app-password+SMTP path.
+gmail_oauth:
+    client_id: ""
+    client_secret: ""

@@ -6,6 +6,7 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -19,10 +20,30 @@ import (
 	"time"
 
 	"golang.org/x/crypto/pbkdf2"
+	"golang.org/x/oauth2"
 	"maunium.net/go/mautrix/bridgev2/database"
 )
 
-// EmailAccount represents a stored email account with credentials
+// AuthType identifies which credential mechanism is in use for an email account.
+const (
+	AuthTypePassword   = "password"    // legacy: SMTP+IMAP via app password / normal password
+	AuthTypeOAuthGmail = "oauth-gmail" // Gmail / Workspace via Google OAuth (device flow)
+)
+
+// OAuthProvider identifiers persisted in EmailAccount.OAuthProvider.
+const (
+	OAuthProviderGoogle    = "google"
+	OAuthProviderMicrosoft = "microsoft" // reserved for v2; not yet emitted
+)
+
+// EmailAccount represents a stored email account with credentials.
+//
+// Authentication is one of two modes, indicated by AuthType:
+//
+//   - AuthTypePassword (default for backward compat): Password is an app
+//     password used with PLAIN auth on SMTP and IMAP.
+//   - AuthTypeOAuthGmail: OAuthRefreshToken / OAuthAccessToken / OAuthExpiry
+//     hold the encrypted Google OAuth tokens. Password is unused.
 type EmailAccount struct {
 	UserMXID         string    `json:"user_mxid"`
 	Email            string    `json:"email"`
@@ -34,6 +55,18 @@ type EmailAccount struct {
 	CreatedAt        time.Time `json:"created_at"`
 	LastSyncTime     time.Time `json:"last_sync_time"`
 	MonitoredFolders []string  `json:"monitored_folders"` // List of folders to monitor (e.g., ["INBOX", "BridgeToBeeper"])
+
+	// AuthType is "password" or "oauth-gmail". Empty value reads as "password"
+	// for legacy rows.
+	AuthType string `json:"auth_type"`
+
+	// OAuth fields populated when AuthType == AuthTypeOAuthGmail. Tokens stored
+	// in the database are AES-GCM encrypted; the in-memory struct holds plaintext
+	// after a successful Load*. Expiry is the access-token expiry as time.Time.
+	OAuthProvider     string    `json:"oauth_provider,omitempty"`
+	OAuthRefreshToken string    `json:"oauth_refresh_token,omitempty"`
+	OAuthAccessToken  string    `json:"oauth_access_token,omitempty"`
+	OAuthExpiry       time.Time `json:"oauth_expiry,omitempty"`
 }
 
 // GetMonitoredFoldersJSON serializes MonitoredFolders to JSON for database storage
@@ -298,7 +331,10 @@ func decryptString(stored string) (string, error) {
 }
 
 func (eaq *EmailAccountQuery) CreateTable(ctx context.Context) error {
-	// Create table
+	// Create table. New columns (auth_type and the oauth_* group) are NULLable
+	// for the migration path on existing databases; the ALTER statements below
+	// take care of adding them when CREATE TABLE IF NOT EXISTS finds an older
+	// schema already in place.
 	_, err := eaq.DB.Exec(ctx, `
 		CREATE TABLE IF NOT EXISTS email_accounts (
 			user_mxid TEXT NOT NULL,
@@ -311,6 +347,11 @@ func (eaq *EmailAccountQuery) CreateTable(ctx context.Context) error {
 			created_at TIMESTAMP NOT NULL,
 			last_sync_time TIMESTAMP,
 			monitored_folders TEXT DEFAULT '["INBOX"]',
+			auth_type TEXT NOT NULL DEFAULT 'password',
+			oauth_provider TEXT,
+			oauth_refresh_token TEXT,
+			oauth_access_token TEXT,
+			oauth_expiry INTEGER,
 			PRIMARY KEY (user_mxid, email)
 		)
 	`)
@@ -318,15 +359,23 @@ func (eaq *EmailAccountQuery) CreateTable(ctx context.Context) error {
 		return err
 	}
 
-	// Add monitored_folders column to existing tables (migration)
-	// SQLite will ignore this if column already exists (we check first)
-	_, _ = eaq.DB.Exec(ctx, `
-		ALTER TABLE email_accounts ADD COLUMN monitored_folders TEXT DEFAULT '["INBOX"]'
-	`)
+	// Migration ALTERs: SQLite returns an error when the column already exists,
+	// which we deliberately swallow. Each statement is independent so a single
+	// already-applied migration doesn't block the rest.
+	for _, stmt := range []string{
+		`ALTER TABLE email_accounts ADD COLUMN monitored_folders TEXT DEFAULT '["INBOX"]'`,
+		`ALTER TABLE email_accounts ADD COLUMN auth_type TEXT NOT NULL DEFAULT 'password'`,
+		`ALTER TABLE email_accounts ADD COLUMN oauth_provider TEXT`,
+		`ALTER TABLE email_accounts ADD COLUMN oauth_refresh_token TEXT`,
+		`ALTER TABLE email_accounts ADD COLUMN oauth_access_token TEXT`,
+		`ALTER TABLE email_accounts ADD COLUMN oauth_expiry INTEGER`,
+	} {
+		_, _ = eaq.DB.Exec(ctx, stmt)
+	}
 
 	// Create performance indexes
 	_, err = eaq.DB.Exec(ctx, `
-		CREATE INDEX IF NOT EXISTS idx_email_accounts_user_created 
+		CREATE INDEX IF NOT EXISTS idx_email_accounts_user_created
 		ON email_accounts(user_mxid, created_at)
 	`)
 	if err != nil {
@@ -334,11 +383,114 @@ func (eaq *EmailAccountQuery) CreateTable(ctx context.Context) error {
 	}
 
 	_, err = eaq.DB.Exec(ctx, `
-		CREATE INDEX IF NOT EXISTS idx_email_accounts_last_sync 
+		CREATE INDEX IF NOT EXISTS idx_email_accounts_last_sync
 		ON email_accounts(user_mxid, last_sync_time)
 	`)
 
 	return err
+}
+
+// SaveOAuthToken persists the OAuth refresh + access token for the given
+// account, encrypting both tokens at rest with the same AES-GCM key used for
+// passwords. Sets auth_type='oauth-gmail' and oauth_provider=provider.
+//
+// The account row must already exist (created by the IMAP login flow). This
+// method does NOT create the row — it updates it in place.
+func (eaq *EmailAccountQuery) SaveOAuthToken(ctx context.Context, userMXID, email, provider string, tok *oauth2.Token) error {
+	if tok == nil {
+		return errors.New("SaveOAuthToken: nil token")
+	}
+	if provider == "" {
+		provider = OAuthProviderGoogle
+	}
+
+	encRefresh, err := encryptString(tok.RefreshToken)
+	if err != nil {
+		return fmt.Errorf("encrypt refresh token: %w", err)
+	}
+	encAccess, err := encryptString(tok.AccessToken)
+	if err != nil {
+		return fmt.Errorf("encrypt access token: %w", err)
+	}
+
+	expiryNanos := tok.Expiry.UnixNano()
+	if tok.Expiry.IsZero() {
+		expiryNanos = 0
+	}
+
+	authType := AuthTypeOAuthGmail
+	res, err := eaq.DB.Exec(ctx, `
+		UPDATE email_accounts
+		SET auth_type = ?, oauth_provider = ?, oauth_refresh_token = ?, oauth_access_token = ?, oauth_expiry = ?
+		WHERE user_mxid = ? AND email = ?
+	`, authType, provider, encRefresh, encAccess, expiryNanos, userMXID, email)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("SaveOAuthToken: no email_accounts row for %s/%s", userMXID, email)
+	}
+	return nil
+}
+
+// LoadOAuthToken returns the saved OAuth token for the account. If the account
+// is not in OAuth mode (auth_type != "oauth-gmail") it returns ("", nil, nil)
+// so callers can fall back to the password path.
+func (eaq *EmailAccountQuery) LoadOAuthToken(ctx context.Context, userMXID, email string) (string, *oauth2.Token, error) {
+	rows, err := eaq.DB.Query(ctx, `
+		SELECT auth_type, COALESCE(oauth_provider, ''), COALESCE(oauth_refresh_token, ''),
+		       COALESCE(oauth_access_token, ''), COALESCE(oauth_expiry, 0)
+		FROM email_accounts
+		WHERE user_mxid = ? AND email = ?
+	`, userMXID, email)
+	if err != nil {
+		return "", nil, err
+	}
+	defer rows.Close()
+
+	if !rows.Next() {
+		if rerr := rows.Err(); rerr != nil {
+			return "", nil, rerr
+		}
+		return "", nil, nil
+	}
+
+	var authType, provider, encRefresh, encAccess string
+	var expiryNanos sql.NullInt64
+	if err := rows.Scan(&authType, &provider, &encRefresh, &encAccess, &expiryNanos); err != nil {
+		return "", nil, err
+	}
+
+	if authType != AuthTypeOAuthGmail {
+		return "", nil, nil
+	}
+	if encRefresh == "" {
+		return provider, nil, errors.New("LoadOAuthToken: account is oauth-gmail but has no refresh token stored")
+	}
+
+	refresh, err := decryptString(encRefresh)
+	if err != nil {
+		return provider, nil, fmt.Errorf("decrypt refresh token: %w", err)
+	}
+	var access string
+	if encAccess != "" {
+		access, err = decryptString(encAccess)
+		if err != nil {
+			// Access token may be missing or stale; that's fine, the refresh
+			// token will mint a new one.
+			access = ""
+		}
+	}
+
+	tok := &oauth2.Token{
+		AccessToken:  access,
+		RefreshToken: refresh,
+		TokenType:    "Bearer",
+	}
+	if expiryNanos.Valid && expiryNanos.Int64 > 0 {
+		tok.Expiry = time.Unix(0, expiryNanos.Int64)
+	}
+	return provider, tok, nil
 }
 
 func (eaq *EmailAccountQuery) GetAccount(ctx context.Context, userMXID, email string) (*EmailAccount, error) {
