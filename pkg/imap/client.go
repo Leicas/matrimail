@@ -1956,6 +1956,55 @@ func (c *Client) sentIdleLoop(cli *imapclient.Client, stopCh <-chan struct{}) {
 	}
 }
 
+// AppendToSentFolder writes the given raw RFC 5322 MIME bytes into the user's
+// Sent folder via IMAP APPEND, marked as already-seen.
+//
+// Best-effort by design — callers must NOT fail the outbound on this; the
+// message has already been delivered via SMTP. The purpose is visibility in
+// other clients (Gmail web, iOS Mail, Thunderbird, ...) without waiting for
+// SMTP -> IMAP propagation lag, which can be tens of seconds for some
+// providers.
+//
+// No-op for accounts whose Sender is the Gmail API path, because Gmail's API
+// already auto-files the sent message. Callers in pkg/connector/client_send.go
+// branch on Sender.Provider() before invoking this method.
+//
+// Returns an error if no client is connected or the Sent folder couldn't be
+// detected for the account's provider; the underlying APPEND error otherwise.
+func (c *Client) AppendToSentFolder(ctx context.Context, rawMIME []byte) error {
+	if c == nil || c.client == nil {
+		return errors.New("imap: not connected")
+	}
+	if c.sentFolder == "" {
+		return errors.New("imap: Sent folder not detected for this provider")
+	}
+	if len(rawMIME) == 0 {
+		return errors.New("imap: empty MIME bytes")
+	}
+
+	// go-imap v2 beta.6 APPEND signature: Append(mailbox, size, options).
+	// We pass FlagSeen because this is the user's own outbound and there's
+	// no UI affordance for "mark unread" on a just-sent message.
+	cmd := c.client.Append(c.sentFolder, int64(len(rawMIME)), &imap.AppendOptions{
+		Flags: []imap.Flag{imap.FlagSeen},
+	})
+	if cmd == nil {
+		return errors.New("imap: Append returned nil command")
+	}
+	if _, err := cmd.Write(rawMIME); err != nil {
+		_ = cmd.Close()
+		return fmt.Errorf("imap APPEND write: %w", err)
+	}
+	if err := cmd.Close(); err != nil {
+		return fmt.Errorf("imap APPEND close: %w", err)
+	}
+	if _, err := cmd.Wait(); err != nil {
+		return fmt.Errorf("imap APPEND wait: %w", err)
+	}
+	c.log.Debug().Str("mailbox", c.sentFolder).Int("bytes", len(rawMIME)).Msg("APPEND to Sent folder succeeded")
+	return nil
+}
+
 // detectSentFolderForProvider returns a best-effort Sent folder name for a domain.
 func detectSentFolderForProvider(domain string) string {
 	d := strings.ToLower(strings.TrimSpace(domain))

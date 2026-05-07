@@ -60,6 +60,10 @@ type EmailClient struct {
 	// IMAP client
 	IMAPClient *imap.Client
 
+	// Sender drives outbound email (SMTP or Gmail API). Populated by
+	// LoadUserLogin via email.PickSender; consulted by HandleMatrixMessage.
+	Sender email.Sender
+
 	// Configuration
 	config ClientConfig
 
@@ -302,9 +306,66 @@ func (ec *EmailConnector) LoadUserLogin(ctx context.Context, login *bridgev2.Use
 		return err
 	}
 
+	// Build the outbound Sender. Gmail OAuth accounts get the Gmail API path
+	// (which echoes a server-assigned Message-ID we use for dedup); everything
+	// else falls through to provider-specific SMTP submission with PLAIN.
+	if err := ec.buildSender(ctx, emailClient, login, account); err != nil {
+		// Outbound failure shouldn't block inbound — log and continue with a
+		// nil Sender. HandleMatrixMessage will reject sends with a clear error.
+		ec.Bridge.Log.Warn().Err(err).Str("email", emailClient.Email).Msg("Failed to build outbound Sender; inbound still functional")
+	}
+
 	// Start client connections
 	ec.startClientConnections(emailClient, login)
 
+	return nil
+}
+
+// buildSender constructs the outbound email.Sender for an account. For OAuth
+// accounts it loads the persisted refresh token and wraps it in an
+// oauth2.TokenSource so subsequent sends mint a fresh access token; for
+// password accounts it just hands off the app password to PickSender.
+func (ec *EmailConnector) buildSender(ctx context.Context, emailClient *EmailClient, login *bridgev2.UserLogin, account *EmailAccount) error {
+	senderAccount := email.SenderAccount{
+		Email:       emailClient.Email,
+		IsGmail:     email.IsGmailDomain(emailClient.Email),
+		AppPassword: emailClient.Password,
+	}
+
+	if account.AuthType == AuthTypeOAuthGmail {
+		// OAuth path — load token and build a refresh-aware TokenSource.
+		oauthCfg := email.GmailOAuthConfig{
+			ClientID:     ec.Config.GmailOAuth.ClientID,
+			ClientSecret: ec.Config.GmailOAuth.ClientSecret,
+		}
+		if oauthCfg.ClientID == "" || oauthCfg.ClientSecret == "" {
+			return fmt.Errorf("account %s is OAuth but bridge has no gmail_oauth config", emailClient.Email)
+		}
+		_, tok, err := ec.DB.LoadOAuthToken(context.Background(), login.UserMXID.String(), emailClient.Email)
+		if err != nil {
+			return fmt.Errorf("load oauth token: %w", err)
+		}
+		if tok == nil {
+			return fmt.Errorf("account %s is OAuth but has no stored token", emailClient.Email)
+		}
+		// Long-lived background context so token refreshes survive any
+		// per-request context cancellation.
+		senderAccount.OAuthTokenSource = email.TokenSource(context.Background(), oauthCfg, tok)
+		// Workspace custom domains aren't gmail.com; OAuth presence is the
+		// real signal that this account speaks the Gmail API.
+		senderAccount.IsGmail = true
+	}
+
+	logger := ec.Bridge.Log.With().Str("component", "sender").Str("email", emailClient.Email).Logger()
+	sender, err := email.PickSender(ctx, senderAccount, &logger)
+	if err != nil {
+		return fmt.Errorf("build sender: %w", err)
+	}
+	emailClient.Sender = sender
+	ec.Bridge.Log.Info().
+		Str("email", emailClient.Email).
+		Str("provider", sender.Provider()).
+		Msg("Outbound Sender ready")
 	return nil
 }
 
@@ -591,11 +652,66 @@ func (ec *EmailClient) performPeriodicSync(ctx context.Context) {
 	ec.UserLogin.Log.Debug().Msg("[PERIODIC SYNC] Periodic sync completed")
 }
 
-// GetCapabilities returns the capabilities of this network
+// GetCapabilities returns the room-level feature map exposed by matrimail to
+// the bridgev2 framework. The framework's Portal.checkMessageContentCaps
+// consults File BEFORE invoking HandleMatrixMessage and hard-rejects media
+// msgtypes that aren't declared here, so all four (image/file/video/audio)
+// must appear or media simply won't reach the connector.
+//
+// Edits, deletes, reactions, polls, and locations are all rejected — email
+// has no equivalent semantics. Threads are unsupported because matrimail
+// already maps each conversation to its own portal/room. Replies are fully
+// supported (and produce In-Reply-To/References headers).
 func (ec *EmailClient) GetCapabilities(ctx context.Context, portal *bridgev2.Portal) *event.RoomFeatures {
-	// Must return a non-nil RoomFeatures or mautrix will panic when calling GetID.
-	// Email threads are simple and read-only, so use default features.
-	return &event.RoomFeatures{}
+	const maxAttachmentBytes int64 = 25 * 1024 * 1024 // Gmail's per-message attachment ceiling
+
+	return &event.RoomFeatures{
+		ID: "matrimail-email-v1",
+		Formatting: event.FormattingFeatureMap{
+			event.FmtBold:           event.CapLevelFullySupported,
+			event.FmtItalic:         event.CapLevelFullySupported,
+			event.FmtUnderline:      event.CapLevelFullySupported,
+			event.FmtStrikethrough:  event.CapLevelFullySupported,
+			event.FmtInlineCode:     event.CapLevelFullySupported,
+			event.FmtCodeBlock:      event.CapLevelFullySupported,
+			event.FmtBlockquote:     event.CapLevelFullySupported,
+			event.FmtInlineLink:     event.CapLevelFullySupported,
+			event.FmtUnorderedList:  event.CapLevelFullySupported,
+			event.FmtOrderedList:    event.CapLevelFullySupported,
+			event.FmtHeaders:        event.CapLevelFullySupported,
+			event.FmtHorizontalLine: event.CapLevelFullySupported,
+			event.FmtTable:          event.CapLevelPartialSupport,
+			event.FmtCustomEmoji:    event.CapLevelDropped,
+			event.FmtSpoiler:        event.CapLevelDropped,
+		},
+		File: event.FileFeatureMap{
+			event.MsgImage: {
+				MimeTypes: map[string]event.CapabilitySupportLevel{"image/*": event.CapLevelFullySupported},
+				MaxSize:   maxAttachmentBytes,
+				Caption:   event.CapLevelFullySupported,
+			},
+			event.MsgFile: {
+				MimeTypes: map[string]event.CapabilitySupportLevel{"*/*": event.CapLevelFullySupported},
+				MaxSize:   maxAttachmentBytes,
+				Caption:   event.CapLevelFullySupported,
+			},
+			event.MsgVideo: {
+				MimeTypes: map[string]event.CapabilitySupportLevel{"video/*": event.CapLevelFullySupported},
+				MaxSize:   maxAttachmentBytes,
+			},
+			event.MsgAudio: {
+				MimeTypes: map[string]event.CapabilitySupportLevel{"audio/*": event.CapLevelFullySupported},
+				MaxSize:   maxAttachmentBytes,
+			},
+		},
+		Reply:           event.CapLevelFullySupported,
+		Edit:            event.CapLevelRejected,
+		Delete:          event.CapLevelRejected,
+		Reaction:        event.CapLevelRejected,
+		Thread:          event.CapLevelUnsupported,
+		LocationMessage: event.CapLevelRejected,
+		Poll:            event.CapLevelRejected,
+	}
 }
 
 func (ec *EmailClient) IsThisUser(ctx context.Context, userID networkid.UserID) bool {
@@ -614,11 +730,8 @@ func (ec *EmailClient) GetUserInfo(ctx context.Context, ghost *bridgev2.Ghost) (
 	return ec.Main.GetUserInfo(ctx, ghost)
 }
 
-// HandleMatrixMessage implements the NetworkAPI interface
+// HandleMatrixMessage implements the NetworkAPI interface. The full outbound
+// flow lives in client_send.go for review hygiene; this is a thin delegator.
 func (ec *EmailClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.MatrixMessage) (*bridgev2.MatrixMessageResponse, error) {
-	// Email bridge is designed as read-only - Matrix users can view emails but not send replies
-	ec.UserLogin.Log.Warn().Msg("Received Matrix message for read-only email portal")
-	return &bridgev2.MatrixMessageResponse{
-		DB: nil, // No database message entry needed for rejected message
-	}, nil
+	return ec.handleMatrixMessageOutbound(ctx, msg)
 }

@@ -211,8 +211,12 @@ func fnLogin(ce *commands.Event, connector *EmailConnector) {
 		return
 	}
 
-	// Fallback to interactive login process using bridgev2 forms
-	loginProcess, err := connector.CreateLogin(ctx, ce.User, "email-password")
+	// Fallback to interactive login process using bridgev2 forms.
+	// If Gmail OAuth is configured at the bridge level, offer a choice;
+	// otherwise stay on the historical app-password flow.
+	flowID := pickInteractiveLoginFlow(connector)
+
+	loginProcess, err := connector.CreateLogin(ctx, ce.User, flowID)
 	if err != nil {
 		ce.Reply("❌ Failed to start login process: %s", err.Error())
 		return
@@ -227,6 +231,24 @@ func fnLogin(ce *commands.Event, connector *EmailConnector) {
 
 	// Send the updated login instructions to the user
 	ce.Reply(buildEnhancedLoginInstructions(step.Instructions))
+}
+
+// pickInteractiveLoginFlow returns LoginFlowIDOAuthGmail when the bridge is
+// configured for Gmail OAuth, otherwise LoginFlowIDPassword. The bot command
+// historically hardcoded the password flow, which left OAuth-configured
+// bridges without a way to start the OAuth dance from a text command.
+//
+// Heuristic: prefer OAuth iff the admin has wired up gmail_oauth credentials.
+// We can't sniff the user's email here (the form will collect that next),
+// so this is a bridge-wide default; users on non-Gmail domains will be
+// gracefully steered back to the password flow by handleOAuthEmail's email
+// validation if they end up at the OAuth prompt by mistake.
+func pickInteractiveLoginFlow(connector *EmailConnector) string {
+	cfg := connector.Config.GmailOAuth
+	if cfg.ClientID != "" && cfg.ClientSecret != "" {
+		return LoginFlowIDOAuthGmail
+	}
+	return LoginFlowIDPassword
 }
 
 func fnLogout(ce *commands.Event, connector *EmailConnector) {
