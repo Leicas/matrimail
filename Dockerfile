@@ -31,7 +31,6 @@ FROM gcr.io/distroless/cc-debian12:nonroot
 COPY --from=builder /build/matrimail /usr/bin/matrimail
 # Copy only required shared libraries and data from runtime-deps
 COPY --from=runtime-deps /usr/lib/x86_64-linux-gnu/libolm.so.3 /usr/lib/x86_64-linux-gnu/libolm.so.3
-COPY --from=runtime-deps /usr/lib/x86_64-linux-gnu/libolm.so /usr/lib/x86_64-linux-gnu/libolm.so
 COPY --from=runtime-deps /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=runtime-deps /usr/share/zoneinfo /usr/share/zoneinfo
 
