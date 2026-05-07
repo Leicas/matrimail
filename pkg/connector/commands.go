@@ -873,6 +873,116 @@ You can also set the MATRIMAIL_PASSPHRASE environment variable instead of using 
 	}
 }
 
+// fnCompose implements the `!matrimail compose` bot command. It picks a login
+// (the user's first / default email account, or a `from:` override if we add
+// one later), parses the to:/cc:/subject: arguments, and delegates to
+// EmailClient.ResolveIdentifier with createChat=true. The resulting portal is
+// materialized via Bridge.GetPortalByKey + Portal.CreateMatrixRoom — same path
+// the framework's built-in `start-chat` command uses.
+//
+// The synthetic thread is updated in-place to attach the parsed Cc list and
+// Subject so HandleMatrixMessage's draft branch can use them when the user
+// types the first message.
+func fnCompose(ce *commands.Event, connector *EmailConnector) {
+	logins := ce.User.GetUserLogins()
+	if len(logins) == 0 {
+		ce.Reply("ℹ️ You're not connected to any email accounts. Use `!matrimail login` first.")
+		return
+	}
+
+	args, err := parseComposeArgs(ce.RawArgs)
+	if err != nil {
+		ce.Reply("❌ %s\n\n**Usage:** `!matrimail compose to:alice@example.com [cc:bob@example.com] [subject:\"hello\"]`", err.Error())
+		return
+	}
+
+	// Pick the first login's EmailClient. Multi-account users can disambiguate
+	// in v2 with a `from:` argument; for now first-match is good enough and
+	// matches how !matrimail logout / sync default.
+	var client *EmailClient
+	for _, login := range logins {
+		if c, ok := login.Client.(*EmailClient); ok {
+			client = c
+			break
+		}
+	}
+	if client == nil {
+		ce.Reply("❌ Internal error: no usable EmailClient found among your logins.")
+		return
+	}
+
+	resp, err := client.ResolveIdentifier(ce.Ctx, args.To, true)
+	if err != nil {
+		ce.Reply("❌ Failed to start compose thread: %s", err.Error())
+		return
+	}
+	if resp == nil || resp.Chat == nil {
+		ce.Reply("❌ Internal error: ResolveIdentifier returned no chat.")
+		return
+	}
+
+	// Attach the parsed Cc + Subject to the synthetic thread so the first
+	// HandleMatrixMessage call uses them. The thread was just inserted into
+	// the cache by ResolveIdentifier; GetThreadByID returns the same pointer.
+	threadID := strings.TrimPrefix(string(resp.Chat.PortalKey.ID), "thread:")
+	if connector.ThreadManager != nil {
+		if thread := connector.ThreadManager.GetThreadByID(string(client.UserLogin.ID), threadID); thread != nil {
+			thread.Subject = args.Subject
+			thread.Cc = append([]string(nil), args.Cc...)
+			// Fold cc into Participants so resolveRecipients picks them up
+			// alongside the to: address.
+			for _, c := range args.Cc {
+				thread.Participants = append(thread.Participants, strings.ToLower(c))
+			}
+			connector.ThreadManager.CacheForReceiver(string(client.UserLogin.ID), thread)
+		}
+	}
+
+	portal, err := ce.Bridge.GetPortalByKey(ce.Ctx, resp.Chat.PortalKey)
+	if err != nil {
+		ce.Reply("❌ Failed to get portal: %s", err.Error())
+		return
+	}
+
+	// Persist the draft to Portal.Metadata immediately so a bridge restart
+	// before the first send doesn't lose the thread state.
+	portal.Metadata = &PortalMetadata{
+		ThreadID:     threadID,
+		Subject:      args.Subject,
+		Participants: append([]string{strings.ToLower(args.To)}, args.Cc...),
+		IsDraft:      true,
+	}
+
+	chatInfo, err := client.GetChatInfo(ce.Ctx, portal)
+	if err != nil {
+		ce.Reply("❌ Failed to compute chat info: %s", err.Error())
+		return
+	}
+	if portal.MXID == "" {
+		if err := portal.CreateMatrixRoom(ce.Ctx, client.UserLogin, chatInfo); err != nil {
+			ce.Reply("❌ Failed to create Matrix room: %s", err.Error())
+			return
+		}
+	}
+	// CreateMatrixRoom calls Save internally; if we skipped it (room already
+	// existed for some reason), persist the metadata write explicitly.
+	if portal.MXID != "" {
+		if err := portal.Save(ce.Ctx); err != nil {
+			connector.Bridge.Log.Warn().Err(err).Msg("compose: portal.Save (post-create) failed")
+		}
+	}
+
+	subjLine := args.Subject
+	if subjLine == "" {
+		subjLine = "(no subject)"
+	}
+	ccLine := ""
+	if len(args.Cc) > 0 {
+		ccLine = fmt.Sprintf("\n**Cc:** %s", strings.Join(args.Cc, ", "))
+	}
+	ce.Reply("✉️ **New email thread ready**\n\n**To:** %s%s\n**Subject:** %s\n\nOpen the new room and type your message — it will be sent as the first email in the thread.\n\nRoom: [%s](%s)", args.To, ccLine, subjLine, portal.MXID, portal.MXID.URI().MatrixToURL())
+}
+
 // fnConfig handles bridge configuration commands
 func fnConfig(ce *commands.Event, connector *EmailConnector) {
 	if len(ce.Args) == 0 {

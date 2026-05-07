@@ -54,6 +54,11 @@ type EmailLoginProcess struct {
 	// OAuth-flow state — only populated for LoginFlowIDOAuthGmail.
 	// dcr is the device-code dance kickoff; pollResult is filled by the
 	// background goroutine when the user authorizes (or it errors out).
+	//
+	// pollWaitCh is closed when the polling goroutine exits, regardless of
+	// outcome. Phase D switched the wait UX from a user-typed-"done" prompt
+	// to a LoginStepTypeDisplayAndWait flow whose Wait() method blocks on
+	// this channel — bridgev2's framework drives the wait, not the user.
 	oauthOnce   sync.Once
 	oauthCtx    context.Context
 	oauthCancel context.CancelFunc
@@ -62,11 +67,13 @@ type EmailLoginProcess struct {
 	pollDone    bool
 	pollToken   *oauth2.Token
 	pollErr     error
+	pollWaitCh  chan struct{}
 }
 
 var (
-	_ bridgev2.LoginProcess          = (*EmailLoginProcess)(nil)
-	_ bridgev2.LoginProcessUserInput = (*EmailLoginProcess)(nil)
+	_ bridgev2.LoginProcess              = (*EmailLoginProcess)(nil)
+	_ bridgev2.LoginProcessUserInput     = (*EmailLoginProcess)(nil)
+	_ bridgev2.LoginProcessDisplayAndWait = (*EmailLoginProcess)(nil)
 )
 
 // EmailLoginMetadata contains email-specific login metadata
@@ -844,13 +851,15 @@ func (elp *EmailLoginProcess) handleOAuthEmail(ctx context.Context, input map[st
 	elp.oauthCtx = dcCtx
 	elp.oauthCancel = cancel
 
-	// Poll asynchronously so the user can hit "I authorized" without us
-	// blocking the Matrix step UI for minutes.
+	// Poll asynchronously. With LoginStepTypeDisplayAndWait, bridgev2's
+	// LoginProcess.Wait method (see Wait below) blocks on this goroutine's
+	// completion channel and auto-advances the flow — no user input needed.
+	elp.pollWaitCh = make(chan struct{})
 	go elp.runOAuthPoll(emailCfg)
 
 	elp.currentStep = "oauth_wait"
 	return &bridgev2.LoginStep{
-		Type:   bridgev2.LoginStepTypeUserInput,
+		Type:   bridgev2.LoginStepTypeDisplayAndWait,
 		StepID: "oauth_wait",
 		Instructions: fmt.Sprintf(`🔐 **Step 2 of 3 — Authorize matrimail with Google**
 
@@ -861,59 +870,93 @@ func (elp *EmailLoginProcess) handleOAuthEmail(ctx context.Context, input map[st
 
 This code expires in %d seconds.
 
-When you're done, send any message here (e.g. ` + "`done`" + `) and the bridge will check for authorization. If Google reports "still pending", just send another message — we'll keep polling for you.`,
+The bridge will detect authorization automatically and continue — no further action needed here.`,
 			dcr.VerificationURL, elp.email, dcr.UserCode, dcr.ExpiresIn),
-		UserInputParams: &bridgev2.LoginUserInputParams{
-			Fields: []bridgev2.LoginInputDataField{{
-				Type:        bridgev2.LoginInputFieldTypeUsername,
-				ID:          "ack",
-				Name:        "Acknowledge",
-				Description: "Type 'done' once you've authorized in the browser",
-			}},
+		DisplayAndWaitParams: &bridgev2.LoginDisplayAndWaitParams{
+			Type: bridgev2.LoginDisplayTypeCode,
+			Data: dcr.UserCode,
 		},
 	}, nil
 }
 
 // runOAuthPoll runs in a goroutine spawned from handleOAuthEmail. It waits for
 // the user to authorize (or for the device code to expire) and stores the
-// resulting token (or error) on the login process.
+// resulting token (or error) on the login process. On exit it closes
+// pollWaitCh so EmailLoginProcess.Wait can unblock and advance the flow
+// without any user "done" input.
 func (elp *EmailLoginProcess) runOAuthPoll(cfg email.GmailOAuthConfig) {
 	tok, err := email.DeviceCodePoll(elp.oauthCtx, cfg, elp.dcr)
 	elp.pollMu.Lock()
-	defer elp.pollMu.Unlock()
 	elp.pollDone = true
 	elp.pollToken = tok
 	elp.pollErr = err
+	ch := elp.pollWaitCh
+	elp.pollMu.Unlock()
+	if ch != nil {
+		close(ch)
+	}
 }
 
-// handleOAuthWait is invoked when the user pings back after authorizing in
-// the browser. If the poll hasn't completed yet, re-prompt; if it succeeded,
-// validate via Gmail's userinfo, persist the token, and continue into folder
-// selection.
+// Wait satisfies bridgev2.LoginProcessDisplayAndWait. The framework calls
+// this after presenting the device-code step's URL+code to the user; we
+// block until the polling goroutine produces a token (or an error) and then
+// transition straight into folder selection without the user having to type
+// anything.
+//
+// Errors are returned to the framework, which surfaces them as login
+// failures. Context cancellation aborts the wait — typically only happens if
+// the user cancels the login from their client.
+func (elp *EmailLoginProcess) Wait(ctx context.Context) (*bridgev2.LoginStep, error) {
+	elp.pollMu.Lock()
+	ch := elp.pollWaitCh
+	elp.pollMu.Unlock()
+	if ch == nil {
+		return nil, errors.New("OAuth wait called before device-code start; this is a bridge bug")
+	}
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-ch:
+	}
+	return elp.finishOAuthWait(ctx)
+}
+
+// handleOAuthWait is the legacy LoginStepTypeUserInput handler. Phase D
+// switched the OAuth wait to LoginStepTypeDisplayAndWait + Wait(), but we
+// keep this as a defensive fallback for clients that for some reason still
+// submit input against the old step ID. It just delegates to finishOAuthWait
+// once the poll has completed (or re-prompts if it hasn't yet, which can
+// happen when the user types into a stale form).
 func (elp *EmailLoginProcess) handleOAuthWait(ctx context.Context, _ map[string]string) (*bridgev2.LoginStep, error) {
 	elp.pollMu.Lock()
 	done := elp.pollDone
-	tok := elp.pollToken
-	pErr := elp.pollErr
 	elp.pollMu.Unlock()
-
 	if !done {
 		return &bridgev2.LoginStep{
 			Type:   bridgev2.LoginStepTypeUserInput,
 			StepID: "oauth_wait",
-			Instructions: fmt.Sprintf(`⏳ Still waiting for you to authorize at **%s** (code **%s**).
-
-Once you've signed in and clicked "Allow", reply here again and I'll check.`, elp.dcr.VerificationURL, elp.dcr.UserCode),
+			Instructions: fmt.Sprintf(`⏳ Still waiting for you to authorize at **%s** (code **%s**). The bridge is polling automatically.`, elp.dcr.VerificationURL, elp.dcr.UserCode),
 			UserInputParams: &bridgev2.LoginUserInputParams{
 				Fields: []bridgev2.LoginInputDataField{{
 					Type:        bridgev2.LoginInputFieldTypeUsername,
 					ID:          "ack",
 					Name:        "Acknowledge",
-					Description: "Reply once you've authorized",
+					Description: "Reply once you've authorized (optional)",
 				}},
 			},
 		}, nil
 	}
+	return elp.finishOAuthWait(ctx)
+}
+
+// finishOAuthWait converts the now-completed device-code poll into the next
+// LoginStep. Shared between the auto-advancing Wait path (Phase D) and the
+// legacy handleOAuthWait fallback.
+func (elp *EmailLoginProcess) finishOAuthWait(ctx context.Context) (*bridgev2.LoginStep, error) {
+	elp.pollMu.Lock()
+	tok := elp.pollToken
+	pErr := elp.pollErr
+	elp.pollMu.Unlock()
 
 	// Stop the poll context regardless of outcome.
 	if elp.oauthCancel != nil {

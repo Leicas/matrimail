@@ -292,6 +292,15 @@ func (ec *EmailConnector) createCommands() []commands.CommandHandler {
 				Description: "Configure email bridge settings (e.g., config folders)",
 			},
 		},
+		&commands.FullHandler{
+			Func: func(ce *commands.Event) { fnCompose(ce, ec) },
+			Name: "compose",
+			Help: commands.HelpMeta{
+				Section:     HelpSectionInfo,
+				Description: "Start a new email thread.",
+				Args:        `to:<email> [cc:...] [subject:"..."]`,
+			},
+		},
 	}
 }
 
@@ -370,7 +379,31 @@ func (ec *EmailConnector) GetChatInfo(ctx context.Context, portal *bridgev2.Port
 
 	// If we have richer thread info, build the room using RoomManager
 	if ec.ThreadManager != nil && ec.RoomManager != nil {
-		if thread := ec.ThreadManager.GetThreadByID(string(userLogin.ID), threadID); thread != nil {
+		thread := ec.ThreadManager.GetThreadByID(string(userLogin.ID), threadID)
+
+		// Phase D: synthetic compose threads can fall out of the in-memory
+		// cache after 24h. Reconstruct from Portal.Metadata so the room is
+		// still functional after a bridge restart or long idle.
+		if thread == nil && portal != nil {
+			if pm, ok := portal.Metadata.(*PortalMetadata); ok && pm != nil && pm.ThreadID == threadID {
+				thread = &email.EmailThread{
+					ThreadID:     pm.ThreadID,
+					Subject:      pm.Subject,
+					Participants: append([]string(nil), pm.Participants...),
+					References:   append([]string(nil), pm.References...),
+					MessageID:    pm.LastMessageID,
+					IsDraft:      pm.IsDraft,
+				}
+				ec.ThreadManager.CacheForReceiver(string(userLogin.ID), thread)
+				ec.Bridge.Log.Debug().
+					Str("thread_id", threadID).
+					Bool("is_draft", thread.IsDraft).
+					Int("participants", len(thread.Participants)).
+					Msg("Reconstructed thread from Portal.Metadata after ThreadManager cache miss")
+			}
+		}
+
+		if thread != nil {
 			return ec.RoomManager.GetChatInfoForThread(ctx, thread, userLogin)
 		}
 	}
@@ -424,7 +457,12 @@ func (ec *EmailConnector) GetDBMetaTables() []any {
 }
 
 func (ec *EmailConnector) GetDBMetaTypes() database.MetaTypes {
-	return database.MetaTypes{}
+	return database.MetaTypes{
+		// Portal metadata is used to persist synthetic compose threads (and
+		// last-known thread state for normal threads) across the 24h
+		// ThreadManager cache TTL. See pkg/connector/portal_metadata.go.
+		Portal: func() any { return &PortalMetadata{} },
+	}
 }
 
 func (ec *EmailConnector) GetBridgeInfoVersion() (int, int) {

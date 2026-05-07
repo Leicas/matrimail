@@ -45,18 +45,56 @@ func (ec *EmailClient) handleMatrixMessageOutbound(ctx context.Context, msg *bri
 		return nil, errors.New("matrimail: invalid Matrix message (missing content or portal)")
 	}
 
+	// Phase D defensive guard: RoomFeatures already advertises Edit/Delete as
+	// CapLevelRejected so the framework drops these in checkMessageContentCaps,
+	// but a misbehaving client (or a future bridgev2 with looser validation)
+	// could still hand us an m.replace. Email cannot be unsent — surface a
+	// clear error rather than silently re-emitting the body as a fresh message.
+	if msg.Content.RelatesTo != nil {
+		if replaceID := msg.Content.RelatesTo.GetReplaceID(); replaceID != "" {
+			ec.UserLogin.Log.Warn().
+				Str("replace_id", string(replaceID)).
+				Msg("dropping outbound: edits not supported (email cannot be unsent)")
+			return nil, errors.New("matrimail: edits not supported (email cannot be unsent)")
+		}
+	}
+
 	thread, err := ec.resolveThreadForPortal(msg.Portal.ID)
 	if err != nil {
 		return nil, err
 	}
 
-	inReplyTo, references := computeReplyChain(thread, msg.ReplyTo)
+	// IsDraft branch: a synthetic compose thread has never produced an email,
+	// so threading headers must be empty (this is the FIRST message in the
+	// chain). We also fall back to the message body's first line for Subject
+	// if the user never set one via !matrimail compose subject:"...".
+	wasDraft := thread.IsDraft
+	var inReplyTo string
+	var references []string
+	if wasDraft {
+		inReplyTo = ""
+		references = nil
+		if strings.TrimSpace(thread.Subject) == "" {
+			thread.Subject = deriveSubjectFromBody(msg.Content.Body)
+		}
+	} else {
+		inReplyTo, references = computeReplyChain(thread, msg.ReplyTo)
+	}
+
 	to, err := resolveRecipients(thread.Participants, ec.Email)
 	if err != nil {
 		return nil, err
 	}
 
 	om := buildOutgoingMessage(ec.Email, thread, msg, inReplyTo, references, to)
+	if wasDraft {
+		// First send: don't add the "Re:" prefix even if the subject happens
+		// to look like a reply already, and don't inherit any thread state
+		// from the (empty) References list. buildOutgoingMessage already
+		// honors msg.ReplyTo == nil here, so the only override needed is
+		// stripping a stray Re: that the user typed manually.
+		om.Subject = strings.TrimSpace(thread.Subject)
+	}
 
 	// Pull Matrix media (if any) into an EmailAttachment. Best-effort: a
 	// failure here aborts the send because the user clearly intended to
@@ -113,10 +151,33 @@ func (ec *EmailClient) handleMatrixMessageOutbound(ctx context.Context, msg *bri
 
 	// Update thread cache so subsequent replies in the same room thread
 	// against this newly-sent message rather than against the previous tail.
+	thread.References = append(thread.References, dedupKey)
+	thread.MessageID = dedupKey
+	if wasDraft {
+		// First-send conversion: thread is now a real thread, not a draft.
+		// Subsequent messages should produce In-Reply-To/References headers
+		// pointing at this message.
+		thread.IsDraft = false
+	}
 	if ec.Main.ThreadManager != nil {
-		thread.References = append(thread.References, dedupKey)
-		thread.MessageID = dedupKey
 		ec.Main.ThreadManager.CacheForReceiver(string(ec.UserLogin.ID), thread)
+	}
+
+	// Phase D: persist the updated thread state to Portal.Metadata so a 24h
+	// ThreadManager TTL eviction (or a bridge restart) doesn't lose the
+	// References chain. Best-effort; failure is logged but not fatal — the
+	// in-memory cache is still good for at least 24h.
+	pm := &PortalMetadata{
+		ThreadID:      thread.ThreadID,
+		Subject:       thread.Subject,
+		Participants:  append([]string(nil), thread.Participants...),
+		References:    append([]string(nil), thread.References...),
+		LastMessageID: thread.MessageID,
+		IsDraft:       thread.IsDraft,
+	}
+	msg.Portal.Metadata = pm
+	if err := msg.Portal.Save(ctx); err != nil {
+		ec.UserLogin.Log.Warn().Err(err).Msg("save portal metadata failed; thread state will only persist via ThreadManager cache (24h TTL)")
 	}
 
 	return &bridgev2.MatrixMessageResponse{
@@ -126,6 +187,32 @@ func (ec *EmailClient) handleMatrixMessageOutbound(ctx context.Context, msg *bri
 			Timestamp: time.Now(),
 		},
 	}, nil
+}
+
+// deriveSubjectFromBody extracts a subject from the first line of a Matrix
+// message body. Used as a fallback for compose threads where the user never
+// supplied an explicit subject:"..." argument. We cap the length at 78 chars
+// (the soft RFC 5322 line-length recommendation, minus headroom for a "Re:"
+// prefix downstream) and split on either a blank line or a single newline so
+// multi-paragraph messages don't dump the whole body into Subject.
+func deriveSubjectFromBody(body string) string {
+	body = strings.TrimSpace(body)
+	if body == "" {
+		return "(no subject)"
+	}
+	// Take everything up to the first newline.
+	if nl := strings.IndexByte(body, '\n'); nl >= 0 {
+		body = body[:nl]
+	}
+	body = strings.TrimSpace(body)
+	if body == "" {
+		return "(no subject)"
+	}
+	const maxLen = 78
+	if len(body) > maxLen {
+		body = body[:maxLen]
+	}
+	return body
 }
 
 // resolveThreadForPortal looks up the EmailThread that backs this Matrix

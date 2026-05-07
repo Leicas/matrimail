@@ -180,14 +180,23 @@ Once your bridge is running, send these commands in a DM to the bot:
 
 ## Sending email
 
-Matrimail bridges Matrix → Email in addition to Email → Matrix. Two ways to send:
+Once you've connected an account, you can send email from Matrix:
 
-- **Reply in a thread room.** Type a message in any thread room created by the bridge. It is delivered as an email reply on the matching IMAP/SMTP account, threaded via the original `Message-ID` / `References` headers.
-- **Compose a new thread.** From the bot DM, run `!matrimail compose to:foo@bar.com subject:"hi"`. The bridge creates a fresh thread room and sends the first message as a new outbound email.
+- **Reply to a thread**: just type in the thread's Matrix room. Your message becomes an email reply with proper threading headers (`In-Reply-To` + `References`).
+- **Compose a new thread (bot command)**: send `!matrimail compose to:alice@example.com subject:"Project update"` in the bot DM. matrimail creates a new room; your first message in that room becomes the new email.
+- **Compose a new thread (Matrix-native)**: in clients that surface bridge "start chat" (Element, Beeper), enter `alice@example.com` to start a thread. Same first-message-becomes-email behavior.
 
-The bridge dedups the Sent-folder IMAP echo so you only see one copy in Matrix per outbound message.
+### Outbound transport
 
-(v1: SMTP with app password; OAuth/Gmail-API/Graph-API in v2)
+- **Gmail accounts**: outbound goes through the Gmail API (`Users.Messages.Send`) when you've connected via OAuth. Server-assigned `Message-ID` is used for dedup, eliminating the Message-ID-rewrite false-positives that affect SMTP submissions.
+- **Other providers**: SMTP submission on port 587 with STARTTLS. Same app password as your IMAP login.
+- **Sent-folder dedup**: matrimail tracks every Message-ID it sends and skips the inbound IMAP echo so you don't see your own messages twice.
+
+### What's NOT bridged outbound (v1)
+
+- Matrix message edits — email can't be unsent. Edits show a status icon, no email is sent.
+- Matrix redactions — email can't be unsent. Redactions only affect the local Matrix copy.
+- Reactions — emoji reactions don't bridge to email.
 
 Deployment-specific paths:
 
@@ -270,7 +279,7 @@ Most major email providers require you to generate a special "App Password" inst
 5. **Attachments are uploaded to Matrix media.** PDFs, images, documents.
 6. **Participant changes are posted as notices.** CC changes, new recipients.
 
-**Sent folder behavior:** The bridge monitors your Sent folder to capture replies you send from other email clients (Gmail web, phone app, etc.). When matrimail itself sends an outbound message, it tracks the Message-ID and dedups the inbound IMAP echo so you only see one copy in Matrix.
+**Sent folder behavior:** matrimail monitors your Sent folder via IMAP IDLE to capture replies you send from other email clients (Gmail web, phone app, etc.). When matrimail itself sends an outbound email, it records the Message-ID in a dedup table and short-circuits the inbound IMAP echo so you only see one copy in Matrix.
 
 ## Folder Selection
 

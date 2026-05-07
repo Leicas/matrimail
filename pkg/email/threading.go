@@ -30,11 +30,24 @@ type EmailThread struct {
 	MessageID string   // Current message ID
 	InReplyTo string   // Message this is replying to (for threading)
 	References []string // Full thread chain
-	
+
+	// Cc holds explicit carbon-copy recipients for compose flows. Inbound
+	// threading flattens From/To/Cc into Participants, so this is only set
+	// (and consulted) by the compose path in Phase D where we want to keep
+	// To and Cc separated until the first send.
+	Cc []string
+
+	// IsDraft marks a thread as a synthetic compose thread that has not yet
+	// produced an outbound email. The first successful Send clears the flag,
+	// after which the thread behaves like any other (replies thread under
+	// the now-real Message-ID). Persisted via Portal.Metadata so a 24h
+	// ThreadManager cache eviction doesn't lose the user's in-progress draft.
+	IsDraft bool
+
 	// Participant change tracking for Matrix room updates
 	AddedParticipants   []string // Participants added in the latest email
 	RemovedParticipants []string // Participants removed in the latest email
-	
+
 	// Cache management
 	LastAccessed time.Time // For TTL cleanup
 }
