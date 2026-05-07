@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/iFixRobots/emaildawg/pkg/imap"
+	"github.com/Leicas/matrimail/pkg/imap"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/commands"
 )
@@ -20,7 +20,7 @@ var (
 )
 
 func fnPing(ce *commands.Event) {
-	ce.Reply("🏓 **Pong!** The EmailDawg bridge is alive and running.")
+	ce.Reply("🏓 **Pong!** Matrimail is alive and running.")
 }
 
 func fnStatus(ce *commands.Event, connector *EmailConnector) {
@@ -28,13 +28,13 @@ func fnStatus(ce *commands.Event, connector *EmailConnector) {
 
 	if len(logins) == 0 {
 		ce.Reply(`
-**EmailDawg Bridge Status**
+**Matrimail Status**
 
 **Connection Status:** Not connected
 **Email Accounts:** 0
 **Matrix Rooms:** 0 email rooms
 
-**Bridge is ready!** Use ` + "`!email login`" + ` to connect your first email account.
+**Bridge is ready!** Use ` + "`!matrimail login`" + ` to connect your first email account.
 `)
 		return
 	}
@@ -49,20 +49,20 @@ func fnStatus(ce *commands.Event, connector *EmailConnector) {
 
 	if len(accountStatuses) == 0 {
 		ce.Reply(`
-**EmailDawg Bridge Status**
+**Matrimail Status**
 
 **Connection Status:** No active email connections
 **Email Accounts:** 0 monitoring
 **Matrix Rooms:** 0 email rooms
 
-**Note:** You have bridge login(s) but no active IMAP connections. Use ` + "`!email login`" + ` to add email accounts.
+**Note:** You have bridge login(s) but no active IMAP connections. Use ` + "`!matrimail login`" + ` to add email accounts.
 `)
 		return
 	}
 
 	// Build status report
 	statusMsg := `
-**EmailDawg Bridge Status**
+**Matrimail Status**
 
 `
 
@@ -107,7 +107,7 @@ func fnStatus(ce *commands.Event, connector *EmailConnector) {
 	} else if connectedCount > 0 {
 		statusMsg += "⚠️ **Partial connectivity** - Some accounts may need attention."
 	} else {
-		statusMsg += "❌ **No active connections** - Use `!email login` to reconnect."
+		statusMsg += "❌ **No active connections** - Use `!matrimail login` to reconnect."
 	}
 
 	ce.Reply(statusMsg)
@@ -118,7 +118,7 @@ func fnStatus(ce *commands.Event, connector *EmailConnector) {
 func fnNuke(ce *commands.Event, connector *EmailConnector) {
 	// Require explicit confirmation to avoid accidental data loss
 	if len(ce.Args) == 0 || strings.ToLower(ce.Args[0]) != "confirm" {
-		ce.Reply("⚠️ This will DELETE the bridge database files and cannot be undone.\nConfirm with: `!email nuke confirm`.")
+		ce.Reply("⚠️ This will DELETE the bridge database files and cannot be undone.\nConfirm with: `!matrimail nuke confirm`.")
 		return
 	}
 	if connector == nil {
@@ -137,8 +137,19 @@ func fnNuke(ce *commands.Event, connector *EmailConnector) {
 		return
 	}
 
-	// Try common DB file locations using absolute paths for security
+	// Try common DB file locations using absolute paths for security.
+	// Includes legacy emaildawg.db* names so users migrating from the old
+	// binary can still nuke cleanly.
 	relativeCandidates := []string{
+		"matrimail.db",
+		"matrimail.db-wal",
+		"matrimail.db-shm",
+		"data/matrimail.db",
+		"data/matrimail.db-wal",
+		"data/matrimail.db-shm",
+		"sh-matrimail.db",
+		"sh-matrimail.db-wal",
+		"sh-matrimail.db-shm",
 		"emaildawg.db",
 		"emaildawg.db-wal",
 		"emaildawg.db-shm",
@@ -176,7 +187,7 @@ func fnLogin(ce *commands.Event, connector *EmailConnector) {
 	// Check if user has any active logins
 	logins := ce.User.GetUserLogins()
 	if len(logins) > 0 {
-		ce.Reply("✅ You're already logged into %d email account(s). Use `!email list` to see them, or `!email logout` to disconnect.", len(logins))
+		ce.Reply("✅ You're already logged into %d email account(s). Use `!matrimail list` to see them, or `!matrimail logout` to disconnect.", len(logins))
 		return
 	}
 
@@ -188,7 +199,7 @@ func fnLogin(ce *commands.Event, connector *EmailConnector) {
 		// Parse text arguments: email:user@domain.com password:pass or password:"quoted pass"
 		email, password, err := parseLoginArgs(args)
 		if err != nil {
-			ce.Reply("❌ %s\n\n**Usage:** `!email login email:your@email.com password:yourpassword`\n**Or:** `!email login email:your@email.com password:\"password with spaces\"`", err.Error())
+			ce.Reply("❌ %s\n\n**Usage:** `!matrimail login email:your@email.com password:yourpassword`\n**Or:** `!matrimail login email:your@email.com password:\"password with spaces\"`", err.Error())
 			return
 		}
 
@@ -222,7 +233,7 @@ func fnLogout(ce *commands.Event, connector *EmailConnector) {
 	_ = connector // parameter kept for API consistency
 	logins := ce.User.GetUserLogins()
 	if len(logins) == 0 {
-		ce.Reply("ℹ️ You're not connected to any email accounts. Use `!email login` to get started.")
+		ce.Reply("ℹ️ You're not connected to any email accounts. Use `!matrimail login` to get started.")
 		return
 	}
 
@@ -299,11 +310,11 @@ func fnList(ce *commands.Event, connector *EmailConnector) {
 📭 **No email accounts connected**
 
 To get started:
-1. Use ` + "`!email login`" + ` to connect your first email account
+1. Use ` + "`!matrimail login`" + ` to connect your first email account
 2. The bridge supports Gmail, Outlook, Yahoo, FastMail, and custom IMAP servers
 3. Once connected, new emails will automatically create Matrix rooms
 
-Need help? Use ` + "`!email help`" + ` for more information.
+Need help? Use ` + "`!matrimail help`" + ` for more information.
 `)
 		return
 	}
@@ -317,7 +328,7 @@ Need help? Use ` + "`!email help`" + ` for more information.
 	}
 
 	if len(accounts) == 0 {
-		ce.Reply("📭 No email accounts found in database. Use `!email login` to add one.")
+		ce.Reply("📭 No email accounts found in database. Use `!matrimail login` to add one.")
 		return
 	}
 
@@ -373,7 +384,7 @@ Need help? Use ` + "`!email help`" + ` for more information.
 		response += fmt.Sprintf("    Added: %s\n\n", account.CreatedAt.Format("Jan 2, 2006"))
 	}
 
-	response += "💡 Use `!email logout <email>` to remove a specific account."
+	response += "💡 Use `!matrimail logout <email>` to remove a specific account."
 	ce.Reply(response)
 }
 
@@ -381,7 +392,7 @@ func fnSync(ce *commands.Event, connector *EmailConnector) {
 	_ = connector // parameter kept for API consistency
 	logins := ce.User.GetUserLogins()
 	if len(logins) == 0 {
-		ce.Reply("ℹ️ You're not connected to any email accounts. Use `!email login` to get started.")
+		ce.Reply("ℹ️ You're not connected to any email accounts. Use `!matrimail login` to get started.")
 		return
 	}
 
@@ -477,7 +488,7 @@ func fnReconnect(ce *commands.Event, connector *EmailConnector) {
 	_ = connector // parameter kept for API consistency
 	logins := ce.User.GetUserLogins()
 	if len(logins) == 0 {
-		ce.Reply("ℹ️ You're not connected to any email accounts. Use `!email login` to get started.")
+		ce.Reply("ℹ️ You're not connected to any email accounts. Use `!matrimail login` to get started.")
 		return
 	}
 
@@ -674,8 +685,8 @@ func buildEnhancedLoginInstructions(originalInstructions string) string {
 	return prefix + `🔐 **Email Bridge Login**
 
 **Method 1: Quick Command**
-` + "`!email login email:your@email.com password:yourpassword`" + `
-` + "`!email login email:your@email.com password:\"password with spaces\"`" + `
+` + "`!matrimail login email:your@email.com password:yourpassword`" + `
+` + "`!matrimail login email:your@email.com password:\"password with spaces\"`" + `
 
 **Method 2: Form Fields (if supported by your client)**
 📧 **Please enter your email credentials using the form fields below.**
@@ -697,7 +708,7 @@ func buildEnhancedLoginInstructions(originalInstructions string) string {
 
 *The bridge will test your IMAP connection automatically after you submit your credentials.*
 
-**Need help?** Use ` + "`!email help`" + ` for more information or ` + "`!email status`" + ` to check connection status.`
+**Need help?** Use ` + "`!matrimail help`" + ` for more information or ` + "`!matrimail status`" + ` to check connection status.`
 }
 
 func fnPassphrase(ce *commands.Event, connector *EmailConnector) {
@@ -717,7 +728,7 @@ func fnPassphrase(ce *commands.Event, connector *EmailConnector) {
 		}
 
 		// Check if environment variable is set
-		envSet := strings.TrimSpace(os.Getenv("EMAILDAWG_PASSPHRASE")) != ""
+		envSet := strings.TrimSpace(os.Getenv("MATRIMAIL_PASSPHRASE")) != ""
 
 		ce.Reply(`🔐 **Encryption Passphrase Status**
 
@@ -726,11 +737,11 @@ func fnPassphrase(ce *commands.Event, connector *EmailConnector) {
 **File Location:** %s
 
 **Usage:**
-• `+"`!email passphrase generate`"+` - Generate new secure passphrase
-• `+"`!email passphrase show-location`"+` - Show passphrase file path  
-• `+"`!email passphrase set <passphrase>`"+` - Set custom passphrase
+• `+"`!matrimail passphrase generate`"+` - Generate new secure passphrase
+• `+"`!matrimail passphrase show-location`"+` - Show passphrase file path  
+• `+"`!matrimail passphrase set <passphrase>`"+` - Set custom passphrase
 
-**Security Note:** Your email passwords are encrypted using this passphrase. EmailDawg automatically generates one if neither environment variable nor file exists.`,
+**Security Note:** Your email passwords are encrypted using this passphrase. Matrimail automatically generates one if neither environment variable nor file exists.`,
 			map[bool]string{true: "✅ Set", false: "❌ Not set"}[envSet],
 			map[bool]string{true: "✅ Exists", false: "❌ Not found"}[exists],
 			passphrasePath)
@@ -760,7 +771,7 @@ func fnPassphrase(ce *commands.Event, connector *EmailConnector) {
 **Next Steps:**
 • Your existing email accounts will continue to work
 • New logins will use this passphrase for encryption
-• You can also set EMAILDAWG_PASSPHRASE environment variable for production use`,
+• You can also set MATRIMAIL_PASSPHRASE environment variable for production use`,
 			passphrase, passphrasePath)
 
 	case "show-location":
@@ -782,17 +793,17 @@ func fnPassphrase(ce *commands.Event, connector *EmailConnector) {
 **Status:** %s
 
 **Platform-specific locations:**
-• **Linux:** ~/.config/emaildawg/passphrase
-• **macOS:** ~/Library/Application Support/EmailDawg/passphrase  
-• **Windows:** %%APPDATA%%\Roaming\EmailDawg\passphrase
+• **Linux:** ~/.config/matrimail/passphrase
+• **macOS:** ~/Library/Application Support/Matrimail/passphrase
+• **Windows:** %%APPDATA%%\Roaming\Matrimail\passphrase
 
-You can also set the EMAILDAWG_PASSPHRASE environment variable instead of using a file.`,
+You can also set the MATRIMAIL_PASSPHRASE environment variable instead of using a file.`,
 			passphrasePath,
 			map[bool]string{true: "✅ File exists", false: "❌ File not found"}[exists])
 
 	case "set":
 		if len(ce.Args) < 2 {
-			ce.Reply("❌ Missing passphrase argument.\n\n**Usage:** `!email passphrase set <your-passphrase>`")
+			ce.Reply("❌ Missing passphrase argument.\n\n**Usage:** `!matrimail passphrase set <your-passphrase>`")
 			return
 		}
 
@@ -832,7 +843,7 @@ You can also set the EMAILDAWG_PASSPHRASE environment variable instead of using 
 • This passphrase now encrypts your email passwords
 • Existing email accounts will continue to work
 • Make sure to remember this passphrase or store it securely
-• You can override this by setting EMAILDAWG_PASSPHRASE environment variable`,
+• You can override this by setting MATRIMAIL_PASSPHRASE environment variable`,
 			passphrasePath)
 
 	default:
@@ -846,10 +857,10 @@ func fnConfig(ce *commands.Event, connector *EmailConnector) {
 		ce.Reply(`⚙️ **Bridge Configuration**
 
 **Available subcommands:**
-• ` + "`!email config folders`" + ` - Change which folders to monitor
+• ` + "`!matrimail config folders`" + ` - Change which folders to monitor
 
 **Current status:**
-Use ` + "`!email list`" + ` to see your connected accounts and their settings.`)
+Use ` + "`!matrimail list`" + ` to see your connected accounts and their settings.`)
 		return
 	}
 
@@ -869,7 +880,7 @@ func fnConfigFolders(ce *commands.Event, connector *EmailConnector) {
 	_ = connector // parameter kept for API consistency
 	logins := ce.User.GetUserLogins()
 	if len(logins) == 0 {
-		ce.Reply("ℹ️ You're not connected to any email accounts. Use `!email login` to get started.")
+		ce.Reply("ℹ️ You're not connected to any email accounts. Use `!matrimail login` to get started.")
 		return
 	}
 
@@ -879,7 +890,7 @@ func fnConfigFolders(ce *commands.Event, connector *EmailConnector) {
 		accountList.WriteString("📧 You have multiple email accounts. Please specify which account to reconfigure:\n\n")
 		for _, login := range logins {
 			if client, ok := login.Client.(*EmailClient); ok {
-				accountList.WriteString(fmt.Sprintf("• `!email config folders %s`\n", client.Email))
+				accountList.WriteString(fmt.Sprintf("• `!matrimail config folders %s`\n", client.Email))
 			}
 		}
 		ce.Reply(accountList.String())
@@ -918,8 +929,8 @@ To change the monitored folders for **%s**, you'll need to re-authenticate.
 **Why?** Re-authentication ensures your credentials are still valid and allows us to fetch the current folder list.
 
 **To proceed:**
-1. Use `+"`!email logout %s`"+` to disconnect
-2. Use `+"`!email login`"+` to reconnect and choose new folders
+1. Use `+"`!matrimail logout %s`"+` to disconnect
+2. Use `+"`!matrimail login`"+` to reconnect and choose new folders
 
 💡 **Tip:** Your existing Matrix rooms will remain - only the folders being monitored will change.`, targetEmail, targetEmail)
 }

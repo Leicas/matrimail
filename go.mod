@@ -1,4 +1,4 @@
-module github.com/iFixRobots/emaildawg
+module github.com/Leicas/matrimail
 
 go 1.23.0
 

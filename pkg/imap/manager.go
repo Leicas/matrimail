@@ -10,7 +10,7 @@ import (
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/status"
 
-	"github.com/iFixRobots/emaildawg/pkg/email"
+	"github.com/Leicas/matrimail/pkg/email"
 )
 
 // Manager handles multiple IMAP clients for different email accounts

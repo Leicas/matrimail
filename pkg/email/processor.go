@@ -28,8 +28,8 @@ import (
 	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
-	logging "github.com/iFixRobots/emaildawg/pkg/logging"
-	"github.com/iFixRobots/emaildawg/pkg/common"
+	logging "github.com/Leicas/matrimail/pkg/logging"
+	"github.com/Leicas/matrimail/pkg/common"
 )
 
 // Matrix content size limits and thresholds

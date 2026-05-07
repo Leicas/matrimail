@@ -1,10 +1,22 @@
-# emaildawg
+# matrimail
 
-A Matrix–Email bridge built on mautrix bridgev2. Focused on reliable email consumption in Matrix rooms (not chat features).
+A bidirectional Matrix↔Email bridge built on mautrix bridgev2.
 
 ## Status
 
 This project is usable and under active development. Core features work and the bridge is suitable for personal use and small deployments.
+
+## Migration from emaildawg
+
+If you ran the previous `emaildawg` build, do a clean break before starting matrimail:
+
+1. Stop the old bridge.
+2. Delete the old `data/` directory (this drops `emaildawg.db`, the salt file, and any auto-generated passphrase). Credential storage is fresh — you will re-login from Matrix.
+3. Update any `config.yaml` `database.uri` references from `emaildawg.db` to `matrimail.db`.
+4. Update any service files / shell scripts that referenced the `emaildawg` binary or `EMAILDAWG_PASSPHRASE` env var to use `matrimail` and `MATRIMAIL_PASSPHRASE`.
+5. Build and start matrimail, then `!matrimail login` to add your accounts again.
+
+The bridgev2 portal/message DB schema uses `NetworkID = "email"` for both old and new builds, so once you log in again, room/thread keys remain compatible at the protocol layer. Only the credential / config storage is reset.
 
 ## What this bridge does for you
 
@@ -16,7 +28,7 @@ This project is usable and under active development. Core features work and the 
 - **Reliable connections:** Automatically reconnects if your internet hiccups or email server has issues
 - **Cleans up messy emails:** Filters out tracking pixels and tiny placeholder images that clutter your conversations
 - **Secure storage:** Your email credentials are encrypted on your machine
-- **Read-only rooms:** You can see the emails but can't accidentally send replies through the bridge
+- **Reply or compose new threads from Matrix:** Send a message in a thread room to reply, or use `!matrimail compose to:foo@bar.com` to start a new email thread.
 
 ## Architecture
 
@@ -27,7 +39,7 @@ This project is usable and under active development. Core features work and the 
 
 ## Quick start
 
-You can run EmailDawg in two supported ways. Pick one and follow it end-to-end.
+You can run Matrimail in two supported ways. Pick one and follow it end-to-end.
 
 ### A) With Beeper Bridge Manager (recommended for Beeper users)
 
@@ -42,14 +54,14 @@ This is the easiest way if you're already using Beeper's bridge system.
 
 1. **Get the code and run setup:**
    ```bash
-   git clone https://github.com/iFixRobots/emaildawg
-   cd emaildawg
+   git clone https://github.com/Leicas/matrimail
+   cd matrimail
    ./setup.sh
    ```
 2. **What setup.sh does:**
 
    - Installs libolm if you're on macOS and don't have it
-   - Builds the bridge binary (creates `./emaildawg`)
+   - Builds the bridge binary (creates `./matrimail`)
    - Creates a `./data/` folder in your project directory
    - Asks you for a bridge name (just pick something like `my-email-bridge` - this is NOT your email address)
    - Uses bbctl to generate `./data/config.yaml` with Beeper's websocket settings
@@ -60,23 +72,23 @@ This is the easiest way if you're already using Beeper's bridge system.
 4. **Start the bridge:**
 
    ```bash
-   ./emaildawg --config ./data/config.yaml
+   ./matrimail --config ./data/config.yaml
    ```
 
 5. **Add your email account:**
    - Find the bot in your Matrix client (in Beeper, you can go to Settings -> Accounts -> Bridges (under Self-hosted bridges), youremailbridgename here -> Create a bot room)
-   - Send it: `!email login`
+   - Send it: `!matrimail login`
    - Follow the guided setup for your Email account
 
 **Where things are stored:**
 
-- **Config file:** `./data/config.yaml` (in your emaildawg folder)
-- **Database:** `./data/emaildawg.db` (created when you first add an email account)
+- **Config file:** `./data/config.yaml` (in your matrimail folder)
+- **Database:** `./data/matrimail.db` (created when you first add an email account)
 - **Logs:** `./logs/bridge.log` (created when the bridge starts)
 
 **If something goes wrong:**
 
-- Check the logs in your emaildawg folder at `./logs/bridge.log`
+- Check the logs in your matrimail folder at `./logs/bridge.log`
 - Make sure bbctl is logged in: `bbctl whoami`
 - The bridge name you picked doesn't matter - it's just an identifier for bbctl
 
@@ -91,15 +103,15 @@ Prerequisites:
 Steps:
 
 ```bash
-git clone https://github.com/iFixRobots/emaildawg
-cd emaildawg
+git clone https://github.com/Leicas/matrimail
+cd matrimail
 make build
-./emaildawg --generate-example-config
+./matrimail --generate-example-config
 # Edit config.yaml with your homeserver details
 # If you are using a standard homeserver over HTTP appservice:
-#   ./emaildawg --generate-registration
+#   ./matrimail --generate-registration
 #   Add registration.yaml to your homeserver and set appservice -> address/hostname/port accordingly.
-./emaildawg
+./matrimail
 ```
 
 ### C) Docker Compose (standalone)
@@ -107,10 +119,10 @@ make build
 Use this if you want to run the compiled image with SQLite (default). This flow does not use Bridge Manager.
 
 ```bash
-git clone https://github.com/iFixRobots/emaildawg
-cd emaildawg
+git clone https://github.com/Leicas/matrimail
+cd matrimail
 make build
-./emaildawg --generate-example-config
+./matrimail --generate-example-config
 # Edit config.yaml, especially database.uri for container path (see below)
 
 docker-compose up -d
@@ -118,7 +130,7 @@ docker-compose up -d
 
 Notes:
 
-- Config path: docker-compose mounts ./config.yaml into /opt/emaildawg/config.yaml and sets MAUTRIX_CONFIG_PATH accordingly.
+- Config path: docker-compose mounts ./config.yaml into /opt/matrimail/config.yaml and sets MAUTRIX_CONFIG_PATH accordingly.
 - Registration: NOT needed when using websocket mode. Only generate and mount registration.yaml if you run in HTTP appservice mode on a standard homeserver.
 - Data path: The container writes to /home/nonroot/app/data, a volume owned by the nonroot user. No need to create ./data on the host.
 - Postgres: optional. The compose file focuses on SQLite. Add Postgres yourself if desired.
@@ -138,33 +150,44 @@ Once your bridge is running, send these commands in a DM to the bot:
 
 ### Getting Started
 
-- `!email login` — Connect your email account (walks you through the setup)
-- `!email login email:you@gmail.com password:yourapppassword` — Quick setup if you know your details
-- `!email help` — Show available commands and help
+- `!matrimail login` — Connect your email account (walks you through the setup)
+- `!matrimail login email:you@gmail.com password:yourapppassword` — Quick setup if you know your details
+- `!matrimail help` — Show available commands and help
 
 ### Managing Your Accounts
 
-- `!email list` — See all your connected email accounts, status, and monitored folders
-- `!email logout` — Disconnect all email accounts
-- `!email logout you@gmail.com` — Disconnect just one specific account
-- `!email status` — Check if everything's working (connection health, monitoring status)
-- `!email config folders` — Change which folders to monitor (requires logout/login)
+- `!matrimail list` — See all your connected email accounts, status, and monitored folders
+- `!matrimail logout` — Disconnect all email accounts
+- `!matrimail logout you@gmail.com` — Disconnect just one specific account
+- `!matrimail status` — Check if everything's working (connection health, monitoring status)
+- `!matrimail config folders` — Change which folders to monitor (requires logout/login)
 
 ### Troubleshooting
 
-- `!email sync` — Force check for new emails on all accounts
-- `!email sync you@gmail.com` — Force sync just one account
-- `!email reconnect` — Fix connection issues for all accounts
-- `!email reconnect you@gmail.com` — Reconnect just one account
-- `!email ping` — Basic bridge health check
+- `!matrimail sync` — Force check for new emails on all accounts
+- `!matrimail sync you@gmail.com` — Force sync just one account
+- `!matrimail reconnect` — Fix connection issues for all accounts
+- `!matrimail reconnect you@gmail.com` — Reconnect just one account
+- `!matrimail ping` — Basic bridge health check
 
 ### Advanced
 
-- `!email passphrase` — Manage the password that encrypts your email credentials
-- `!email passphrase generate` — Create a new secure encryption password
-- `!email passphrase set <pass>` — Set a custom encryption passphrase
-- `!email passphrase show-location` — Show where the passphrase file is stored
-- `!email nuke confirm` — **DANGER:** Delete all bridge data and reset (requires confirmation)
+- `!matrimail passphrase` — Manage the password that encrypts your email credentials
+- `!matrimail passphrase generate` — Create a new secure encryption password
+- `!matrimail passphrase set <pass>` — Set a custom encryption passphrase
+- `!matrimail passphrase show-location` — Show where the passphrase file is stored
+- `!matrimail nuke confirm` — **DANGER:** Delete all bridge data and reset (requires confirmation)
+
+## Sending email
+
+Matrimail bridges Matrix → Email in addition to Email → Matrix. Two ways to send:
+
+- **Reply in a thread room.** Type a message in any thread room created by the bridge. It is delivered as an email reply on the matching IMAP/SMTP account, threaded via the original `Message-ID` / `References` headers.
+- **Compose a new thread.** From the bot DM, run `!matrimail compose to:foo@bar.com subject:"hi"`. The bridge creates a fresh thread room and sends the first message as a new outbound email.
+
+The bridge dedups the Sent-folder IMAP echo so you only see one copy in Matrix per outbound message.
+
+(v1: SMTP with app password; OAuth/Gmail-API/Graph-API in v2)
 
 Deployment-specific paths:
 
@@ -181,7 +204,7 @@ Docker Compose (distroless nonroot):
 # config.yaml (bridgev2)
 database:
   type: sqlite3
-  uri: "file:/home/nonroot/app/data/emaildawg.db?_fk=1"
+  uri: "file:/home/nonroot/app/data/matrimail.db?_fk=1"
 ```
 
 Host/manual (runs in repo working directory):
@@ -190,12 +213,12 @@ Host/manual (runs in repo working directory):
 # config.yaml (bridgev2)
 database:
   type: sqlite3
-  uri: "file:./data/emaildawg.db?_fk=1"
+  uri: "file:./data/matrimail.db?_fk=1"
 ```
 
 Notes:
 
-- The container data directory is /home/nonroot/app/data (a named volume). Do not point the URI to /opt/emaildawg.
+- The container data directory is /home/nonroot/app/data (a named volume). Do not point the URI to /opt/matrimail.
 - The host data directory is ./data. Ensure it exists and is writable.
 - For Postgres, set type: postgres and provide a proper DSN instead of sqlite3.
 
@@ -203,7 +226,7 @@ Notes:
 
 - Never build or run with nocrypto. libolm is required for proper E2EE support.
 - The Docker image runs as a non-root user; data directory permissions are handled by the image and compose volume mapping.
-- **Encryption passphrase:** Set `EMAILDAWG_PASSPHRASE` environment variable in production, or the bridge will auto-generate one and store it in a file.
+- **Encryption passphrase:** Set `MATRIMAIL_PASSPHRASE` environment variable in production, or the bridge will auto-generate one and store it in a file.
 
 ## Email provider support
 
@@ -244,11 +267,10 @@ Most major email providers require you to generate a special "App Password" inst
 2. **Real-time delivery via IMAP IDLE.** No polling delays.
 3. **Participants come from To/CC/BCC.** Each appears as a ghost user.
 4. **Threading uses Message-ID, References, and In-Reply-To.** Standard RFC 5322.
-5. **Rooms are read-only.** The bridge cannot send emails from Matrix.
-6. **Attachments are uploaded to Matrix media.** PDFs, images, documents.
-7. **Participant changes are posted as notices.** CC changes, new recipients.
+5. **Attachments are uploaded to Matrix media.** PDFs, images, documents.
+6. **Participant changes are posted as notices.** CC changes, new recipients.
 
-**Note on Sent folder:** The bridge monitors your Sent folder to capture replies you send from _other_ email clients (Gmail web, phone app, etc.), so they appear in Matrix threads. It does **not** bridge outbound Matrix messages to email.
+**Sent folder behavior:** The bridge monitors your Sent folder to capture replies you send from other email clients (Gmail web, phone app, etc.). When matrimail itself sends an outbound message, it tracks the Message-ID and dedups the inbound IMAP echo so you only see one copy in Matrix.
 
 ## Folder Selection
 
@@ -269,7 +291,7 @@ When you log in, the bridge shows you all available folders and labels:
 
 After confirming your selection, only emails in those folders will appear in Matrix.
 
-**To change folders later:** Use `!email config folders` - this will guide you to logout and login again to select new folders.
+**To change folders later:** Use `!matrimail config folders` - this will guide you to logout and login again to select new folders.
 
 ## License
 

@@ -17,11 +17,11 @@ import (
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/status"
 
-	"github.com/iFixRobots/emaildawg/pkg/common"
-	"github.com/iFixRobots/emaildawg/pkg/coordinator"
-	"github.com/iFixRobots/emaildawg/pkg/email"
-	logging "github.com/iFixRobots/emaildawg/pkg/logging"
-	"github.com/iFixRobots/emaildawg/pkg/reliability"
+	"github.com/Leicas/matrimail/pkg/common"
+	"github.com/Leicas/matrimail/pkg/coordinator"
+	"github.com/Leicas/matrimail/pkg/email"
+	logging "github.com/Leicas/matrimail/pkg/logging"
+	"github.com/Leicas/matrimail/pkg/reliability"
 )
 
 // IMAP-specific error codes

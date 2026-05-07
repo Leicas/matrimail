@@ -1,6 +1,8 @@
 # Binaries and build artifacts
-mautrix-emaildawg
-emaildawg
+/mautrix-matrimail
+/matrimail
+/mautrix-emaildawg
+/emaildawg
 /bin/
 *.exe
 *.exe~

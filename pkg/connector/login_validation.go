@@ -5,7 +5,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/iFixRobots/emaildawg/pkg/imap"
+	"github.com/Leicas/matrimail/pkg/imap"
 )
 
 // FolderSelectionResult represents the result of validating folder selection input

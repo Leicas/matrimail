@@ -10,7 +10,7 @@ import (
 	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/bridgev2/networkid"
 
-	"github.com/iFixRobots/emaildawg/pkg/imap"
+	"github.com/Leicas/matrimail/pkg/imap"
 )
 
 // EmailLoginProcess represents the email login flow
@@ -68,7 +68,7 @@ func (elp *EmailLoginProcess) Start(ctx context.Context) (*bridgev2.LoginStep, e
 
 // buildLoginInstructions creates helpful login instructions based on common email providers
 func (elp *EmailLoginProcess) buildLoginInstructions() string {
-	return `**Email Bridge Login**
+	return `**Matrimail Login**
 
 📧 **Please enter your email credentials using the form fields below.**
 
@@ -89,7 +89,7 @@ Custom IMAP servers - Auto-detected
 
 *The bridge will test your IMAP connection automatically after you submit your credentials.*
 
-**Need help?** Use ` + "`!email help`" + ` for more information or ` + "`!email status`" + ` to check connection status.`
+**Need help?** Use ` + "`!matrimail help`" + ` for more information or ` + "`!matrimail status`" + ` to check connection status.`
 }
 
 // Cancel cancels the login process
@@ -377,7 +377,7 @@ func (elp *EmailLoginProcess) completeLogin(ctx context.Context) (*bridgev2.Logi
 📁 **Monitoring:**%s
 
 Emails from the selected folder(s) will now appear in Beeper.
-To change folders later, use `+"`!email config folders`"+``, elp.email, folderList.String())
+To change folders later, use `+"`!matrimail config folders`"+``, elp.email, folderList.String())
 
 	return &bridgev2.LoginStep{
 		Type:         bridgev2.LoginStepTypeComplete,

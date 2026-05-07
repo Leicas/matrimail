@@ -82,7 +82,7 @@ var (
 func getDBKey() ([]byte, error) {
 	keyOnce.Do(func() {
 		// Step 1: Check environment variable (highest priority for production)
-		passphrase := strings.TrimSpace(os.Getenv("EMAILDAWG_PASSPHRASE"))
+		passphrase := strings.TrimSpace(os.Getenv("MATRIMAIL_PASSPHRASE"))
 
 		// Step 2: Check for passphrase file if env var not set
 		if passphrase == "" {
@@ -119,7 +119,7 @@ func getDBKey() ([]byte, error) {
 func getUserConfigDir() (string, error) {
 	// Check XDG_CONFIG_HOME first (Linux/Unix)
 	if configDir := os.Getenv("XDG_CONFIG_HOME"); configDir != "" {
-		return filepath.Join(configDir, "emaildawg"), nil
+		return filepath.Join(configDir, "matrimail"), nil
 	}
 
 	// Get user home directory
@@ -131,11 +131,11 @@ func getUserConfigDir() (string, error) {
 	// Platform-specific config paths
 	switch runtime.GOOS {
 	case "windows":
-		return filepath.Join(homeDir, "AppData", "Roaming", "EmailDawg"), nil
+		return filepath.Join(homeDir, "AppData", "Roaming", "Matrimail"), nil
 	case "darwin":
-		return filepath.Join(homeDir, "Library", "Application Support", "EmailDawg"), nil
+		return filepath.Join(homeDir, "Library", "Application Support", "Matrimail"), nil
 	default: // Linux and other Unix-like systems
-		return filepath.Join(homeDir, ".config", "emaildawg"), nil
+		return filepath.Join(homeDir, ".config", "matrimail"), nil
 	}
 }
 
@@ -193,7 +193,7 @@ func generateAndStorePassphrase() (string, error) {
 
 	// Log to stderr to avoid potential information disclosure in stdout logs
 	fmt.Fprintf(os.Stderr, "Auto-generated secure passphrase stored (check config directory)\n")
-	fmt.Fprintf(os.Stderr, "EmailDawg is ready! Your credentials will be securely encrypted.\n")
+	fmt.Fprintf(os.Stderr, "Matrimail is ready! Your credentials will be securely encrypted.\n")
 
 	return passphrase, nil
 }
@@ -206,7 +206,7 @@ func getSalt() ([]byte, error) {
 		return nil, fmt.Errorf("failed to get working directory: %w", err)
 	}
 	dataDir := filepath.Join(cwd, "data")
-	saltPath := filepath.Join(dataDir, "emaildawg.salt")
+	saltPath := filepath.Join(dataDir, "matrimail.salt")
 
 	// Try to read existing salt
 	if data, err := os.ReadFile(saltPath); err == nil {

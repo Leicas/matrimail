@@ -13,9 +13,9 @@ import (
 	"maunium.net/go/mautrix/bridgev2/status"
 	"maunium.net/go/mautrix/event"
 
-	"github.com/iFixRobots/emaildawg/pkg/coordinator"
-	"github.com/iFixRobots/emaildawg/pkg/imap"
-	"github.com/iFixRobots/emaildawg/pkg/reliability"
+	"github.com/Leicas/matrimail/pkg/coordinator"
+	"github.com/Leicas/matrimail/pkg/imap"
+	"github.com/Leicas/matrimail/pkg/reliability"
 )
 
 // ClientConfig holds configuration for EmailClient timing and behavior

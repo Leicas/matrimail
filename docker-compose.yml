@@ -1,20 +1,20 @@
 version: '3.8'
 
 services:
-  emaildawg:
+  matrimail:
     build: .
     restart: unless-stopped
     # NOTE: SQLite DB path inside the container should use this data directory:
     #
     #   database:
     #     type: sqlite3
-    #     uri: "file:/home/nonroot/app/data/emaildawg.db?_fk=1"
+    #     uri: "file:/home/nonroot/app/data/matrimail.db?_fk=1"
     #
     volumes:
-      - ./config.yaml:/opt/emaildawg/config.yaml:ro
-      - emaildawg_data:/home/nonroot/app/data
+      - ./config.yaml:/opt/matrimail/config.yaml:ro
+      - matrimail_data:/home/nonroot/app/data
     environment:
-      - MAUTRIX_CONFIG_PATH=/opt/emaildawg/config.yaml
+      - MAUTRIX_CONFIG_PATH=/opt/matrimail/config.yaml
     networks:
       - mautrix
 
@@ -24,16 +24,16 @@ services:
   #   image: postgres:15-alpine
   #   restart: unless-stopped
   #   environment:
-  #     POSTGRES_USER: mautrix_emaildawg
+  #     POSTGRES_USER: mautrix_matrimail
   #     POSTGRES_PASSWORD: change_me
-  #     POSTGRES_DB: mautrix_emaildawg
+  #     POSTGRES_DB: mautrix_matrimail
   #   volumes:
   #     - postgres_data:/var/lib/postgresql/data
   #   networks:
   #     - mautrix
 
 volumes:
-  emaildawg_data:
+  matrimail_data:
     driver: local
   postgres_data:
     driver: local

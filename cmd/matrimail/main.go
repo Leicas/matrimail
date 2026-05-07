@@ -4,7 +4,7 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 	"maunium.net/go/mautrix/bridgev2/matrix/mxmain"
 
-	"github.com/iFixRobots/emaildawg/pkg/connector"
+	"github.com/Leicas/matrimail/pkg/connector"
 )
 
 // Information to find out exactly which commit the bridge was built from.
@@ -17,9 +17,9 @@ var (
 
 var c = &connector.EmailConnector{}
 var m = mxmain.BridgeMain{
-	Name:        "emaildawg",
-	URL:         "https://github.com/iFixRobots/emaildawg",
-	Description: "A Matrix-Email puppeting bridge.",
+	Name:        "matrimail",
+	URL:         "https://github.com/Leicas/matrimail",
+	Description: "Matrimail — bidirectional Matrix↔Email bridge.",
 	Version:     "0.1.0",
 	Connector:   c,
 }

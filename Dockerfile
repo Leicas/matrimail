@@ -1,5 +1,5 @@
 # --- Builder stage (Debian bookworm) ---
-FROM golang:1.22.5-bookworm AS builder
+FROM golang:1.24-bookworm AS builder
 
 # Install build dependencies including libolm
 RUN apt-get update -y \
@@ -12,7 +12,7 @@ RUN go mod download
 
 COPY . .
 # Build with CGO to link against libolm
-RUN CGO_ENABLED=1 go build -o emaildawg ./cmd/emaildawg
+RUN CGO_ENABLED=1 go build -o matrimail ./cmd/matrimail
 
 # Prepare a data directory we can chown in final image via COPY --chown
 RUN mkdir -p /runtime-data
@@ -28,7 +28,7 @@ RUN apt-get update -y \
 FROM gcr.io/distroless/cc-debian12:nonroot
 
 # Copy the compiled binary
-COPY --from=builder /build/emaildawg /usr/bin/emaildawg
+COPY --from=builder /build/matrimail /usr/bin/matrimail
 # Copy only required shared libraries and data from runtime-deps
 COPY --from=runtime-deps /usr/lib/x86_64-linux-gnu/libolm.so.3 /usr/lib/x86_64-linux-gnu/libolm.so.3
 COPY --from=runtime-deps /usr/lib/x86_64-linux-gnu/libolm.so /usr/lib/x86_64-linux-gnu/libolm.so
@@ -43,4 +43,4 @@ COPY --from=builder --chown=nonroot:nonroot /runtime-data /home/nonroot/app/data
 VOLUME ["/home/nonroot/app/data"]
 
 EXPOSE 29319
-ENTRYPOINT ["/usr/bin/emaildawg"]
+ENTRYPOINT ["/usr/bin/matrimail"]

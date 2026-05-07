@@ -8,10 +8,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/iFixRobots/emaildawg/pkg/common"
-	"github.com/iFixRobots/emaildawg/pkg/email"
-	"github.com/iFixRobots/emaildawg/pkg/imap"
-	"github.com/iFixRobots/emaildawg/pkg/matrix"
+	"github.com/Leicas/matrimail/pkg/common"
+	"github.com/Leicas/matrimail/pkg/email"
+	"github.com/Leicas/matrimail/pkg/imap"
+	"github.com/Leicas/matrimail/pkg/matrix"
 	"github.com/rs/zerolog"
 	"go.mau.fi/util/ptr"
 	"maunium.net/go/mautrix/bridgev2"
@@ -37,13 +37,13 @@ var (
 
 func (ec *EmailConnector) GetName() bridgev2.BridgeName {
 	return bridgev2.BridgeName{
-		DisplayName:          "EmailDawg",
+		DisplayName:          "Matrimail",
 		NetworkURL:           "https://en.wikipedia.org/wiki/Email",
 		NetworkIcon:          "mxc://maunium.net/YgtkucQxWlKJxwMBJR6Ggz5w", // Email icon
 		NetworkID:            "email",
 		BeeperBridgeType:     "email",
 		DefaultPort:          29319, // Different from WhatsApp's 29318
-		DefaultCommandPrefix: "!email",
+		DefaultCommandPrefix: "!matrimail",
 	}
 }
 
@@ -74,8 +74,8 @@ func (ec *EmailConnector) Init(bridge *bridgev2.Bridge) {
 	}
 
 	// Allow environment overrides for verbose logging
-	// EMAILDAWG_LOG_LEVEL: trace|debug|info|warn|error
-	if lvl := strings.ToLower(os.Getenv("EMAILDAWG_LOG_LEVEL")); lvl != "" {
+	// MATRIMAIL_LOG_LEVEL: trace|debug|info|warn|error
+	if lvl := strings.ToLower(os.Getenv("MATRIMAIL_LOG_LEVEL")); lvl != "" {
 		switch lvl {
 		case "trace":
 			zerolog.SetGlobalLevel(zerolog.TraceLevel)
@@ -92,7 +92,7 @@ func (ec *EmailConnector) Init(bridge *bridgev2.Bridge) {
 		// Default to maximum verbosity for analysis
 		zerolog.SetGlobalLevel(zerolog.TraceLevel)
 	}
-	if san := strings.ToLower(os.Getenv("EMAILDAWG_LOG_SANITIZED")); san == "false" || san == "0" || san == "no" {
+	if san := strings.ToLower(os.Getenv("MATRIMAIL_LOG_SANITIZED")); san == "false" || san == "0" || san == "no" {
 		ec.Config.Logging.Sanitized = false
 	}
 
