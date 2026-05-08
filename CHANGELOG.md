@@ -1,3 +1,10 @@
+## [1.2.1](https://github.com/Leicas/matrimail/compare/v1.2.0...v1.2.1) (2026-05-08)
+
+
+### Bug Fixes
+
+* **crypto:** persist passphrase under ./data/ so it survives restart ([4b0cb53](https://github.com/Leicas/matrimail/commit/4b0cb5346b17266e4757a72040db548534a8e5bd))
+
 ## [1.2.0](https://github.com/Leicas/matrimail/compare/v1.1.3...v1.2.0) (2026-05-08)
 
 
