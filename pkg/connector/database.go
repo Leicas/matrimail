@@ -19,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	"go.mau.fi/util/dbutil"
 	"golang.org/x/crypto/pbkdf2"
 	"golang.org/x/oauth2"
 	"maunium.net/go/mautrix/bridgev2/database"
@@ -355,6 +356,14 @@ func (eaq *EmailAccountQuery) CreateTable(ctx context.Context) error {
 	// for the migration path on existing databases; the ALTER statements below
 	// take care of adding them when CREATE TABLE IF NOT EXISTS finds an older
 	// schema already in place.
+	// Note on column types: the four columns below that store Go nanosecond
+	// timestamps (oauth_expiry, oauth_token_issued_at, last_reauth_notice_at)
+	// or 64-bit Gmail history IDs (oauth_history_id) MUST be BIGINT, not
+	// INTEGER. Postgres INTEGER is 32-bit (max ~2.1B) and overflows on values
+	// like UnixNano() ≈ 1.7×10¹⁸; SQLite's INTEGER affinity is 64-bit so it
+	// doesn't care either way. Use BIGINT in the canonical schema and a
+	// best-effort `ALTER COLUMN ... TYPE BIGINT` on Postgres for any existing
+	// deployments that predate this migration.
 	_, err := eaq.DB.Exec(ctx, `
 		CREATE TABLE IF NOT EXISTS email_accounts (
 			user_mxid TEXT NOT NULL,
@@ -371,11 +380,11 @@ func (eaq *EmailAccountQuery) CreateTable(ctx context.Context) error {
 			oauth_provider TEXT,
 			oauth_refresh_token TEXT,
 			oauth_access_token TEXT,
-			oauth_expiry INTEGER,
+			oauth_expiry BIGINT,
 			scope_mode TEXT,
-			oauth_token_issued_at INTEGER,
-			oauth_history_id INTEGER,
-			last_reauth_notice_at INTEGER,
+			oauth_token_issued_at BIGINT,
+			oauth_history_id BIGINT,
+			last_reauth_notice_at BIGINT,
 			PRIMARY KEY (user_mxid, email)
 		)
 	`)
@@ -392,14 +401,31 @@ func (eaq *EmailAccountQuery) CreateTable(ctx context.Context) error {
 		`ALTER TABLE email_accounts ADD COLUMN oauth_provider TEXT`,
 		`ALTER TABLE email_accounts ADD COLUMN oauth_refresh_token TEXT`,
 		`ALTER TABLE email_accounts ADD COLUMN oauth_access_token TEXT`,
-		`ALTER TABLE email_accounts ADD COLUMN oauth_expiry INTEGER`,
+		`ALTER TABLE email_accounts ADD COLUMN oauth_expiry BIGINT`,
 		// New (auth-code rework):
 		`ALTER TABLE email_accounts ADD COLUMN scope_mode TEXT`,
-		`ALTER TABLE email_accounts ADD COLUMN oauth_token_issued_at INTEGER`,
-		`ALTER TABLE email_accounts ADD COLUMN oauth_history_id INTEGER`,
-		`ALTER TABLE email_accounts ADD COLUMN last_reauth_notice_at INTEGER`,
+		`ALTER TABLE email_accounts ADD COLUMN oauth_token_issued_at BIGINT`,
+		`ALTER TABLE email_accounts ADD COLUMN oauth_history_id BIGINT`,
+		`ALTER TABLE email_accounts ADD COLUMN last_reauth_notice_at BIGINT`,
 	} {
 		_, _ = eaq.DB.Exec(ctx, stmt)
+	}
+
+	// Postgres-only widening migrations for deployments that originally
+	// CREATE'd these columns as INTEGER (32-bit) before this fix. SQLite's
+	// INTEGER affinity is already 64-bit and the syntax differs, so skip
+	// there. Errors are swallowed because the columns may have been BIGINT
+	// from the start (fresh deploys after this fix), in which case the ALTER
+	// is a no-op that Postgres returns success on anyway.
+	if eaq.DB.Dialect == dbutil.Postgres {
+		for _, stmt := range []string{
+			`ALTER TABLE email_accounts ALTER COLUMN oauth_expiry TYPE BIGINT`,
+			`ALTER TABLE email_accounts ALTER COLUMN oauth_token_issued_at TYPE BIGINT`,
+			`ALTER TABLE email_accounts ALTER COLUMN oauth_history_id TYPE BIGINT`,
+			`ALTER TABLE email_accounts ALTER COLUMN last_reauth_notice_at TYPE BIGINT`,
+		} {
+			_, _ = eaq.DB.Exec(ctx, stmt)
+		}
 	}
 
 	// Create performance indexes
