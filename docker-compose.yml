@@ -2,7 +2,8 @@ version: '3.8'
 
 services:
   matrimail:
-    build: .
+    image: ghcr.io/leicas/matrimail:latest
+    # build: .  # uncomment for local dev (without a published image)
     restart: unless-stopped
     # NOTE: SQLite DB path inside the container should use this data directory:
     #
