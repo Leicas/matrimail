@@ -169,85 +169,93 @@ func getDBKey() ([]byte, error) {
 	return dbKey, nil
 }
 
-// getUserConfigDir returns the user's config directory for cross-platform support
-func getUserConfigDir() (string, error) {
-	// Check XDG_CONFIG_HOME first (Linux/Unix)
+// getLegacyConfigDir returns the platform's user-config dir under
+// ~/.config/matrimail / AppData / Library — the historical passphrase
+// location. New writes go to ./data/ via getPassphraseFilePath, but reads
+// still consult this path for installations that already auto-generated a
+// passphrase before the move (so an upgrade doesn't blow away the existing
+// key and force a re-login of every account).
+func getLegacyConfigDir() (string, error) {
 	if configDir := os.Getenv("XDG_CONFIG_HOME"); configDir != "" {
 		return filepath.Join(configDir, "matrimail"), nil
 	}
-
-	// Get user home directory
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		return "", fmt.Errorf("failed to get user home directory: %w", err)
 	}
-
-	// Platform-specific config paths
 	switch runtime.GOOS {
 	case "windows":
 		return filepath.Join(homeDir, "AppData", "Roaming", "Matrimail"), nil
 	case "darwin":
 		return filepath.Join(homeDir, "Library", "Application Support", "Matrimail"), nil
-	default: // Linux and other Unix-like systems
+	default:
 		return filepath.Join(homeDir, ".config", "matrimail"), nil
 	}
 }
 
-// getPassphraseFilePath returns the path to the passphrase file
+// getPassphraseFilePath returns the canonical passphrase path:
+// ./data/passphrase relative to the bridge's CWD. Co-located with the
+// SQLite DB and matrimail.salt — both already inside ./data/ and on the
+// persistent volume in the example docker-compose. Storing the passphrase
+// elsewhere (the old ~/.config/matrimail/passphrase) means that on
+// Distroless containers where only ./data/ is volume-mounted, every
+// restart loses the auto-generated passphrase, existing encrypted
+// credentials become undecryptable, and the user gets logged out on every
+// restart.
 func getPassphraseFilePath() (string, error) {
-	configDir, err := getUserConfigDir()
+	cwd, err := os.Getwd()
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to get working directory: %w", err)
 	}
-	return filepath.Join(configDir, "passphrase"), nil
+	return filepath.Join(cwd, "data", "passphrase"), nil
 }
 
-// readPassphraseFile reads passphrase from the user config file
+// readPassphraseFile reads the passphrase from ./data/passphrase, falling
+// back to the legacy ~/.config/matrimail/passphrase location for backward
+// compat with installations that auto-generated their key before the move.
 func readPassphraseFile() (string, error) {
-	passphrasePath, err := getPassphraseFilePath()
+	primary, err := getPassphraseFilePath()
 	if err != nil {
 		return "", err
 	}
-
-	data, err := os.ReadFile(passphrasePath)
+	if data, err := os.ReadFile(primary); err == nil {
+		return strings.TrimSpace(string(data)), nil
+	}
+	legacyDir, err := getLegacyConfigDir()
 	if err != nil {
 		return "", err
 	}
-
+	data, err := os.ReadFile(filepath.Join(legacyDir, "passphrase"))
+	if err != nil {
+		return "", err
+	}
 	return strings.TrimSpace(string(data)), nil
 }
 
-// generateAndStorePassphrase creates a new secure passphrase and stores it
+// generateAndStorePassphrase creates a new secure passphrase and writes it to
+// the primary location (./data/passphrase). Co-located with the SQLite DB
+// and salt so a single volume mount persists everything the encryption
+// layer needs across container restarts.
 func generateAndStorePassphrase() (string, error) {
-	// Generate 32 random bytes for a secure passphrase
 	randomBytes := make([]byte, 32)
 	if _, err := io.ReadFull(rand.Reader, randomBytes); err != nil {
 		return "", fmt.Errorf("failed to generate random passphrase: %w", err)
 	}
-
-	// Encode as base64 for storage
 	passphrase := base64.StdEncoding.EncodeToString(randomBytes)
 
-	// Get passphrase file path
 	passphrasePath, err := getPassphraseFilePath()
 	if err != nil {
 		return "", err
 	}
-
-	// Create config directory with secure permissions
-	configDir := filepath.Dir(passphrasePath)
-	if err := os.MkdirAll(configDir, 0o700); err != nil {
-		return "", fmt.Errorf("failed to create config directory: %w", err)
+	if err := os.MkdirAll(filepath.Dir(passphrasePath), 0o700); err != nil {
+		return "", fmt.Errorf("failed to create data directory: %w", err)
 	}
-
-	// Write passphrase file with secure permissions
 	if err := os.WriteFile(passphrasePath, []byte(passphrase), 0o600); err != nil {
 		return "", fmt.Errorf("failed to write passphrase file: %w", err)
 	}
 
-	// Log to stderr to avoid potential information disclosure in stdout logs
-	fmt.Fprintf(os.Stderr, "Auto-generated secure passphrase stored (check config directory)\n")
-	fmt.Fprintf(os.Stderr, "Matrimail is ready! Your credentials will be securely encrypted.\n")
+	fmt.Fprintf(os.Stderr, "Auto-generated secure passphrase stored at %s\n", passphrasePath)
+	fmt.Fprintf(os.Stderr, "Set MATRIMAIL_PASSPHRASE in your environment to override this default.\n")
 
 	return passphrase, nil
 }
