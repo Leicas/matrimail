@@ -58,17 +58,27 @@ func (q *SentDedupQuery) CreateTable(ctx context.Context) error {
 	if q == nil || q.DB == nil {
 		return fmt.Errorf("SentDedupQuery: nil DB")
 	}
+	// sent_at uses BIGINT (not INTEGER) for the same reason as the
+	// email_accounts oauth_* timestamps: Postgres INTEGER is 32-bit and would
+	// overflow at the Y2038 boundary (and instantly if we ever switched this
+	// to UnixNano). SQLite is fine either way.
 	if _, err := q.DB.Exec(ctx, `
 		CREATE TABLE IF NOT EXISTS matrimail_sent_dedup (
-			bridge_id     TEXT    NOT NULL,
-			receiver      TEXT    NOT NULL,
-			message_id    TEXT    NOT NULL,
-			matrix_evt_id TEXT    NOT NULL,
-			sent_at       INTEGER NOT NULL,
+			bridge_id     TEXT   NOT NULL,
+			receiver      TEXT   NOT NULL,
+			message_id    TEXT   NOT NULL,
+			matrix_evt_id TEXT   NOT NULL,
+			sent_at       BIGINT NOT NULL,
 			PRIMARY KEY (bridge_id, receiver, message_id)
 		)
 	`); err != nil {
 		return fmt.Errorf("create matrimail_sent_dedup: %w", err)
+	}
+	// Best-effort widening for any pre-existing Postgres deployments where
+	// sent_at was created as INTEGER. SQLite's syntax differs and its affinity
+	// is already 64-bit, so skip there. Errors are swallowed.
+	if q.DB.Dialect == dbutil.Postgres {
+		_, _ = q.DB.Exec(ctx, `ALTER TABLE matrimail_sent_dedup ALTER COLUMN sent_at TYPE BIGINT`)
 	}
 	if _, err := q.DB.Exec(ctx, `
 		CREATE INDEX IF NOT EXISTS idx_matrimail_sent_dedup_sent_at
