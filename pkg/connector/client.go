@@ -566,8 +566,26 @@ func (ec *EmailClient) LogoutRemote(ctx context.Context) {
 	ec.UserLogin.Log.Info().Msg("Successfully logged out from email account")
 }
 
+// IsLoggedIn reports whether this account has valid credentials, per
+// bridgev2's contract (see networkinterface.go: "should not do any IO
+// operations"). It's a credential-state check, not a connection-state check.
+//
+// Two valid transports indicate logged-in credentials:
+//   - IMAPClient (IMAP IDLE for password and full-mode OAuth — built only
+//     after credentials are accepted by the IMAP server)
+//   - Sender (Gmail API for modify-mode OAuth — built only when an OAuth
+//     token is present and the account isn't flagged for re-auth, see
+//     buildSender)
+//
+// Without this OR, modify-mode Gmail accounts (no IMAP, Gmail-API-only) would
+// always look "not logged in" because IMAPClient is nil by design — and
+// FindPreferredLogin would refuse to route outbound Matrix events through
+// the portal, surfacing "You're not logged in" on every compose-room send.
 func (ec *EmailClient) IsLoggedIn() bool {
-	return ec.IMAPClient != nil && ec.isConnected.Load()
+	if ec.IMAPClient != nil {
+		return true
+	}
+	return ec.Sender != nil
 }
 
 func (ec *EmailClient) IsConnected() bool {
