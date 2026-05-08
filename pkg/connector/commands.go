@@ -2,7 +2,9 @@ package connector
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1206,13 +1208,19 @@ To change the monitored folders for **%s**, you'll need to re-authenticate.
 💡 **Tip:** Your existing Matrix rooms will remain - only the folders being monitored will change.`, targetEmail, targetEmail)
 }
 
-// fnOAuth handles `!matrimail oauth <subcommand>`. Two subcommands:
+// fnOAuth handles `!matrimail oauth <subcommand>`. Three subcommands:
+//
+//   - paste-code <redirect-url>: completes an in-progress OAuth login when
+//     the loopback callback can't reach the bridge (truly headless host, no
+//     SSH tunneling). The user authorizes in their browser, the redirect to
+//     127.0.0.1:NNNN/callback fails, and they paste the URL from their
+//     address bar here. The bridge already has the matching state and PKCE
+//     verifier in memory and finishes the exchange normally.
 //
 //   - paste-token <email> <refresh_token>: bootstraps an account with a
-//     user-supplied refresh token. The "headless escape hatch" — for users
-//     whose bridge host can't expose a loopback port to a browser. Run the
-//     OAuth flow elsewhere (e.g. against the same client_id from a tool that
-//     supports loopback), then paste the refresh token here.
+//     user-supplied refresh token. The other "headless escape hatch" — for
+//     users who can run the full OAuth flow on a separate workstation. Token
+//     is validated against Google before being stored.
 //
 //   - revoke <email>: revokes the refresh token at Google's end (severing
 //     matrimail's access from the user's Google account dashboard) and
@@ -1222,9 +1230,12 @@ func fnOAuth(ce *commands.Event, connector *EmailConnector) {
 	if len(ce.Args) == 0 {
 		ce.Reply(`**!matrimail oauth — subcommands**
 
+- ` + "`!matrimail oauth paste-code <redirect-url>`" + ` — finish a headless
+  OAuth login by pasting the URL your browser was redirected to (the page
+  that failed to load with "can't connect to 127.0.0.1:NNNN").
 - ` + "`!matrimail oauth paste-token <email> <refresh_token>`" + ` — register
-  an account using a refresh token you obtained out-of-band (headless
-  deployments). Token is validated against Google before being stored.
+  an account using a refresh token you obtained out-of-band on another
+  machine. Token is validated against Google before being stored.
 - ` + "`!matrimail oauth revoke <email>`" + ` — revoke matrimail's access at
   Google and clear the local OAuth state for the account.`)
 		return
@@ -1232,6 +1243,8 @@ func fnOAuth(ce *commands.Event, connector *EmailConnector) {
 
 	sub := strings.ToLower(ce.Args[0])
 	switch sub {
+	case "paste-code", "code":
+		fnOAuthPasteCode(ce, connector)
 	case "paste-token", "paste":
 		fnOAuthPasteToken(ce, connector)
 	case "revoke":
@@ -1239,6 +1252,108 @@ func fnOAuth(ce *commands.Event, connector *EmailConnector) {
 	default:
 		ce.Reply("❌ Unknown subcommand: `%s`. Try `!matrimail oauth` for help.", sub)
 	}
+}
+
+// fnOAuthPasteCode implements `!matrimail oauth paste-code <redirect-url>`.
+// Parses the OAuth callback URL the user copied from their browser's address
+// bar, looks up the user's in-progress OAuth login, and injects the code
+// into the listener so finishOAuthExchange runs as if the loopback callback
+// had fired normally.
+func fnOAuthPasteCode(ce *commands.Event, connector *EmailConnector) {
+	if len(ce.Args) < 2 {
+		ce.Reply(`Usage: ` + "`!matrimail oauth paste-code <redirect-url>`" + `
+
+After authorizing in your browser, the page will fail to load (because the
+loopback redirect points at the bridge host, not your laptop). Copy the
+**full URL** from your browser's address bar — it looks like:
+
+    http://127.0.0.1:NNNNN/callback?code=4/0AY...&state=...
+
+…and pass it to this command. The bridge already has the matching state and
+PKCE verifier in memory and will exchange the code for a refresh token.
+
+This is for truly headless deployments where you can't SSH-tunnel the
+loopback port either. If you can SSH-tunnel, just open the URL on your
+workstation and the normal flow completes itself.`)
+		return
+	}
+
+	// Join everything after the subcommand — the URL itself is one arg, but
+	// being defensive in case a client did weird whitespace-splitting.
+	raw := strings.TrimSpace(strings.Join(ce.Args[1:], ""))
+	code, state, err := parseOAuthCallbackURL(raw)
+	if err != nil {
+		ce.Reply("❌ Could not parse that URL: %v\n\nMake sure you copied the full `http://127.0.0.1:NNNN/callback?code=...&state=...` URL from your browser, including the `?` and everything after.", err)
+		return
+	}
+
+	listener := connector.lookupOAuthListener(ce.User.MXID.String())
+	if listener == nil {
+		ce.Reply("❌ No in-progress OAuth login found for your account.\n\nRun `!matrimail login` first, complete Step 2 by opening the URL Google gives you, then come back and paste the redirect URL here.")
+		return
+	}
+	if err := listener.Inject(code, state); err != nil {
+		ce.Reply("❌ Code injection failed: %v\n\nIf this says \"state mismatch\", the URL is from an older login session — run `!matrimail login` again to start a fresh one and use the new URL it gives you.", err)
+		return
+	}
+	ce.Reply("✅ **Authorization code accepted.** Watch the login DM — the bridge will continue with profile verification and folder selection.")
+}
+
+// parseOAuthCallbackURL extracts the `code` and `state` query parameters from
+// a Google OAuth redirect URL. Accepts a full URL (`http://127.0.0.1:.../callback?...`)
+// or a bare query string (`?code=...&state=...` or `code=...&state=...`) so
+// users can paste in whatever format their browser gave them. Surfaces a
+// clear error if Google returned `?error=...` instead of a code.
+func parseOAuthCallbackURL(raw string) (code, state string, err error) {
+	q, err := extractCallbackQuery(raw)
+	if err != nil {
+		return "", "", err
+	}
+	if errCode := q.Get("error"); errCode != "" {
+		desc := q.Get("error_description")
+		if desc == "" {
+			return "", "", fmt.Errorf("Google reported error %q", errCode)
+		}
+		return "", "", fmt.Errorf("Google reported error %q: %s", errCode, desc)
+	}
+	code = q.Get("code")
+	state = q.Get("state")
+	if code == "" {
+		return "", "", errors.New("missing 'code' parameter in URL")
+	}
+	if state == "" {
+		return "", "", errors.New("missing 'state' parameter in URL")
+	}
+	return code, state, nil
+}
+
+// extractCallbackQuery turns either a full URL or a query-string fragment
+// into url.Values. Tolerant of leading `?` and of URLs with no scheme.
+func extractCallbackQuery(raw string) (url.Values, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, errors.New("empty input")
+	}
+	if strings.Contains(raw, "://") {
+		u, err := url.Parse(raw)
+		if err != nil {
+			return nil, err
+		}
+		return u.Query(), nil
+	}
+	if strings.HasPrefix(raw, "?") {
+		raw = raw[1:]
+	}
+	// If the user pasted "/callback?code=...&state=..." (path + query)
+	// without scheme, strip the path prefix.
+	if i := strings.Index(raw, "?"); i >= 0 {
+		raw = raw[i+1:]
+	}
+	q, err := url.ParseQuery(raw)
+	if err != nil {
+		return nil, err
+	}
+	return q, nil
 }
 
 // fnOAuthPasteToken implements `!matrimail oauth paste-token <email> <refresh_token>`.
