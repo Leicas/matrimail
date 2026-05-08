@@ -8,6 +8,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	gmail "google.golang.org/api/gmail/v1"
+	"google.golang.org/api/option"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/bridgev2/status"
@@ -63,6 +65,13 @@ type EmailClient struct {
 	// Sender drives outbound email (SMTP or Gmail API). Populated by
 	// LoadUserLogin via email.PickSender; consulted by HandleMatrixMessage.
 	Sender email.Sender
+
+	// Signature is the user's Gmail-configured HTML signature, fetched once
+	// at LoadUserLogin time via users.settings.sendAs.list. Empty for
+	// non-Gmail accounts and for Gmail users who haven't set a signature.
+	// Appended to outbound messages on NEW threads only (replies go without
+	// it, matching Gmail's "include only on first message" toggle).
+	Signature string
 
 	// Configuration
 	config ClientConfig
@@ -386,6 +395,16 @@ func (ec *EmailConnector) LoadUserLogin(ctx context.Context, login *bridgev2.Use
 		ec.Bridge.Log.Warn().Err(err).Str("email", emailClient.Email).Msg("Failed to build outbound Sender; inbound still functional")
 	}
 
+	// Best-effort fetch of the Gmail-side signature so new outbound threads
+	// carry it (matches the Gmail web UI's "include signature on first
+	// message" behavior). Cached on EmailClient.Signature for the bridge's
+	// lifetime; bridge restart re-fetches.
+	if account.AuthType == AuthTypeOAuthGmail {
+		if err := ec.loadGmailSignature(ctx, emailClient, login); err != nil {
+			ec.Bridge.Log.Debug().Err(err).Str("email", emailClient.Email).Msg("Failed to load Gmail signature; outbound new-thread emails will go without one")
+		}
+	}
+
 	// Spawn the Gmail-API inbound poller for modify-mode accounts. The poller
 	// is independent of the IMAP client (which is skipped for modify-mode in
 	// createIMAPClient) and runs on its own goroutine. needs-reauth accounts
@@ -468,6 +487,36 @@ func (ec *EmailConnector) buildSender(ctx context.Context, emailClient *EmailCli
 		Str("email", emailClient.Email).
 		Str("provider", sender.Provider()).
 		Msg("Outbound Sender ready")
+	return nil
+}
+
+// loadGmailSignature fetches the user's Gmail-side signature via
+// users.settings.sendAs.list and caches it on the EmailClient. Best-effort:
+// errors are surfaced as the returned error and the caller logs at Debug.
+// Empty signature (user hasn't configured one in Gmail) is not an error.
+func (ec *EmailConnector) loadGmailSignature(ctx context.Context, emailClient *EmailClient, login *bridgev2.UserLogin) error {
+	cfg := ec.Config.GmailOAuth
+	emailCfg := email.GmailOAuthConfig{ClientID: cfg.ClientID, ClientSecret: cfg.ClientSecret}
+	info, err := ec.DB.GetOAuthAccount(ctx, login.UserMXID.String(), emailClient.Email)
+	if err != nil {
+		return fmt.Errorf("get oauth account: %w", err)
+	}
+	if info == nil || info.Token == nil {
+		return nil
+	}
+	ts := email.TokenSource(context.Background(), emailCfg, info.Token)
+	svc, err := gmail.NewService(ctx, option.WithTokenSource(ts))
+	if err != nil {
+		return fmt.Errorf("create gmail service: %w", err)
+	}
+	sig, err := email.FetchGmailSignature(ctx, svc, emailClient.Email)
+	if err != nil {
+		return fmt.Errorf("fetch signature: %w", err)
+	}
+	emailClient.Signature = sig
+	if sig != "" {
+		ec.Bridge.Log.Info().Str("email", emailClient.Email).Int("signature_html_len", len(sig)).Msg("Loaded Gmail signature for outbound new-thread emails")
+	}
 	return nil
 }
 
