@@ -1,3 +1,10 @@
+## [1.2.2](https://github.com/Leicas/matrimail/compare/v1.2.1...v1.2.2) (2026-05-08)
+
+
+### Bug Fixes
+
+* **threading:** preserve thread participants across degenerate emails ([5a4773c](https://github.com/Leicas/matrimail/commit/5a4773c4ab8ad5f8fd9bf4797d03b961315b9a64))
+
 ## [1.2.1](https://github.com/Leicas/matrimail/compare/v1.2.0...v1.2.1) (2026-05-08)
 
 
