@@ -6,13 +6,31 @@ RUN apt-get update -y \
     && apt-get install -y --no-install-recommends git ca-certificates build-essential libolm-dev \
     && rm -rf /var/lib/apt/lists/*
 
+# TARGETARCH is provided by buildx for multi-platform builds. We use it to
+# scope the Go build cache per-arch so cross-arch builds (linux/amd64 +
+# linux/arm64 in release.yml) don't corrupt each other's compile artifacts.
+# Single-arch builds (docker.yml) just get a stable, arch-specific cache key.
+ARG TARGETARCH
+
 WORKDIR /build
 COPY go.mod go.sum ./
-RUN go mod download
+# BuildKit cache mount on the module cache: persists across builds via the
+# GHA cache (cache-to: type=gha,mode=max in the workflows). go.mod/go.sum
+# changes still bust the layer because the COPY above is what triggers
+# re-execution; the mount only kicks in when this RUN actually runs.
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
 
 COPY . .
-# Build with CGO to link against libolm
-RUN CGO_ENABLED=1 go build -o matrimail ./cmd/matrimail
+# Build with CGO to link against libolm. Cache mounts:
+#   - /root/.cache/go-build: Go's compile cache; arch-scoped because compiled
+#     object files are platform-specific (sharing across arm64+amd64 corrupts).
+#   - /go/pkg/mod: module source cache; arch-agnostic.
+# These persist across builds (combined with cache-to: type=gha,mode=max),
+# turning cold ~5-8 min builds into ~30-90s incremental ones.
+RUN --mount=type=cache,target=/root/.cache/go-build,id=go-build-${TARGETARCH} \
+    --mount=type=cache,target=/go/pkg/mod \
+    CGO_ENABLED=1 go build -o matrimail ./cmd/matrimail
 
 # Prepare a data directory we can chown in final image via COPY --chown
 RUN mkdir -p /runtime-data
