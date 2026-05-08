@@ -1,3 +1,10 @@
+## [1.1.1](https://github.com/Leicas/matrimail/compare/v1.1.0...v1.1.1) (2026-05-08)
+
+
+### Bug Fixes
+
+* **db:** widen oauth + dedup timestamps to BIGINT for Postgres ([5d32bce](https://github.com/Leicas/matrimail/commit/5d32bcece5f1dd870d143ff4421d0e103a1159c4))
+
 ## [1.1.0](https://github.com/Leicas/matrimail/compare/v1.0.1...v1.1.0) (2026-05-08)
 
 
