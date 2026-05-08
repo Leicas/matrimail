@@ -87,6 +87,16 @@ func (ec *EmailClient) handleMatrixMessageOutbound(ctx context.Context, msg *bri
 	}
 
 	om := buildOutgoingMessage(ec.Email, thread, msg, inReplyTo, references, to)
+	// Append the user's Gmail-side signature on NEW threads only, matching
+	// the Gmail web UI's "include signature on first message in thread"
+	// behavior. Signature is empty when the account isn't OAuth-Gmail or
+	// when the user hasn't configured one — AppendSignature is a no-op then.
+	if inReplyTo == "" && len(references) == 0 && ec.Signature != "" {
+		om.TextBody = email.AppendSignature(om.TextBody, ec.Signature, false)
+		if om.HTMLBody != "" {
+			om.HTMLBody = email.AppendSignature(om.HTMLBody, ec.Signature, true)
+		}
+	}
 	if wasDraft {
 		// First send: don't add the "Re:" prefix even if the subject happens
 		// to look like a reply already, and don't inherit any thread state
