@@ -12,8 +12,12 @@ name: Docker
 # (ghcr.io/<owner>/<repo>). GHCR auth uses the workflow's built-in GITHUB_TOKEN
 # — no secrets to configure.
 #
-# Multi-arch: linux/amd64 + linux/arm64 (covers x86 servers and Apple Silicon /
-# Raspberry Pi self-hosters).
+# Single-arch (linux/amd64) for branch/PR/dispatch builds — multi-arch
+# (linux/amd64 + linux/arm64) is reserved for release.yml, which is the only
+# workflow that ships images consumers actually pull. arm64 under QEMU on an
+# amd64 runner is brutally slow for Go+CGO (libolm), so cutting it from the
+# hot path saves ~50% wall time on every PR/feat build without losing
+# multi-arch support for end users.
 
 on:
   push:
@@ -80,7 +84,9 @@ jobs:
         with:
           context: .
           file: ./Dockerfile
-          platforms: linux/amd64,linux/arm64
+          # amd64 only on this workflow — release.yml ships the multi-arch
+          # image. See the file-level comment above for rationale.
+          platforms: linux/amd64
           # Don't push from PRs — write access isn't guaranteed and we don't
           # want PR images polluting the registry. Pushes from main / feat /
           # tags / dispatch all publish.
