@@ -1,3 +1,10 @@
+## [1.3.0](https://github.com/Leicas/matrimail/compare/v1.2.2...v1.3.0) (2026-05-08)
+
+
+### Features
+
+* **matrix:** auto-tag matrimail portals as m.lowpriority ([d6b8d8f](https://github.com/Leicas/matrimail/commit/d6b8d8fd7bbd8fd238918059823ebc339b2c4067))
+
 ## [1.2.2](https://github.com/Leicas/matrimail/compare/v1.2.1...v1.2.2) (2026-05-08)
 
 
