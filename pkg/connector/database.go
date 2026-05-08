@@ -703,7 +703,8 @@ func (eaq *EmailAccountQuery) GetOAuthAccount(ctx context.Context, userMXID, ema
 func (eaq *EmailAccountQuery) GetAccount(ctx context.Context, userMXID, email string) (*EmailAccount, error) {
 	account := &EmailAccount{}
 	rows, err := eaq.DB.Query(ctx, dialectQuery(eaq.DB.Dialect, `
-		SELECT user_mxid, email, username, password, host, port, tls, created_at, last_sync_time, COALESCE(monitored_folders, '["INBOX"]')
+		SELECT user_mxid, email, username, password, host, port, tls, created_at, last_sync_time,
+		       COALESCE(monitored_folders, '["INBOX"]'), COALESCE(auth_type, 'password')
 		FROM email_accounts
 		WHERE user_mxid = ? AND email = ?
 	`), userMXID, email)
@@ -724,7 +725,7 @@ func (eaq *EmailAccountQuery) GetAccount(ctx context.Context, userMXID, email st
 	err = rows.Scan(
 		&account.UserMXID, &account.Email, &account.Username, &account.Password,
 		&account.Host, &account.Port, &account.TLS, &account.CreatedAt, &account.LastSyncTime,
-		&monitoredFoldersJSON,
+		&monitoredFoldersJSON, &account.AuthType,
 	)
 	if err != nil {
 		return nil, err
@@ -742,7 +743,8 @@ func (eaq *EmailAccountQuery) GetAccount(ctx context.Context, userMXID, email st
 
 func (eaq *EmailAccountQuery) GetUserAccounts(ctx context.Context, userMXID string) ([]*EmailAccount, error) {
 	rows, err := eaq.DB.Query(ctx, dialectQuery(eaq.DB.Dialect, `
-		SELECT user_mxid, email, username, password, host, port, tls, created_at, last_sync_time, COALESCE(monitored_folders, '["INBOX"]')
+		SELECT user_mxid, email, username, password, host, port, tls, created_at, last_sync_time,
+		       COALESCE(monitored_folders, '["INBOX"]'), COALESCE(auth_type, 'password')
 		FROM email_accounts
 		WHERE user_mxid = ?
 		ORDER BY created_at ASC
@@ -759,7 +761,7 @@ func (eaq *EmailAccountQuery) GetUserAccounts(ctx context.Context, userMXID stri
 		err = rows.Scan(
 			&account.UserMXID, &account.Email, &account.Username, &account.Password,
 			&account.Host, &account.Port, &account.TLS, &account.CreatedAt, &account.LastSyncTime,
-			&monitoredFoldersJSON,
+			&monitoredFoldersJSON, &account.AuthType,
 		)
 		if err != nil {
 			return nil, err
@@ -779,7 +781,8 @@ func (eaq *EmailAccountQuery) GetUserAccounts(ctx context.Context, userMXID stri
 // GetUserAccountsBasic returns user accounts without decrypting passwords (for display/status)
 func (eaq *EmailAccountQuery) GetUserAccountsBasic(ctx context.Context, userMXID string) ([]*EmailAccount, error) {
 	rows, err := eaq.DB.Query(ctx, dialectQuery(eaq.DB.Dialect, `
-		SELECT user_mxid, email, username, host, port, tls, created_at, last_sync_time, COALESCE(monitored_folders, '["INBOX"]')
+		SELECT user_mxid, email, username, host, port, tls, created_at, last_sync_time,
+		       COALESCE(monitored_folders, '["INBOX"]'), COALESCE(auth_type, 'password')
 		FROM email_accounts
 		WHERE user_mxid = ?
 		ORDER BY created_at ASC
@@ -797,7 +800,7 @@ func (eaq *EmailAccountQuery) GetUserAccountsBasic(ctx context.Context, userMXID
 		err = rows.Scan(
 			&account.UserMXID, &account.Email, &account.Username,
 			&account.Host, &account.Port, &account.TLS, &account.CreatedAt, &account.LastSyncTime,
-			&monitoredFoldersJSON,
+			&monitoredFoldersJSON, &account.AuthType,
 		)
 		if err != nil {
 			return nil, err
