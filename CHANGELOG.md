@@ -1,3 +1,10 @@
+## [1.1.2](https://github.com/Leicas/matrimail/compare/v1.1.1...v1.1.2) (2026-05-08)
+
+
+### Bug Fixes
+
+* **oauth:** IsLoggedIn returns true for modify-scope Gmail accounts ([6081b07](https://github.com/Leicas/matrimail/commit/6081b070675fad6c404adcca5deff5654c0a4fe5))
+
 ## [1.1.1](https://github.com/Leicas/matrimail/compare/v1.1.0...v1.1.1) (2026-05-08)
 
 
