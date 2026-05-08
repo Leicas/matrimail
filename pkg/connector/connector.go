@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Leicas/matrimail/pkg/common"
@@ -43,6 +44,16 @@ type EmailConnector struct {
 	// initCancel cancels the long-lived context used for the dedup cleanup
 	// goroutine. Set in Init, called from Stop.
 	initCancel context.CancelFunc
+
+	// oauthListeners maps a user's MXID to their currently-active OAuth
+	// loopback listener so the `!matrimail oauth paste-code` admin command can
+	// inject a code/state pair into the in-progress login (used on headless
+	// hosts where the loopback callback can't be reached from the user's
+	// browser even via SSH tunneling). Registered by handleOAuthEmail right
+	// after StartOAuthListener; unregistered by the Wait/handleOAuthWait
+	// success/error paths and by Cancel().
+	oauthListenersMu sync.Mutex
+	oauthListeners   map[string]*OAuthListener
 }
 
 var (
@@ -332,8 +343,8 @@ func (ec *EmailConnector) createCommands() []commands.CommandHandler {
 			Name: "oauth",
 			Help: commands.HelpMeta{
 				Section:     HelpSectionAuth,
-				Description: "Manage OAuth tokens (paste-token / revoke).",
-				Args:        `paste-token <email> <refresh_token> | revoke <email>`,
+				Description: "Manage OAuth tokens (paste-code / paste-token / revoke).",
+				Args:        `paste-code <redirect-url> | paste-token <email> <refresh_token> | revoke <email>`,
 			},
 		},
 	}
@@ -364,6 +375,39 @@ func (ec *EmailConnector) Stop() {
 	}
 
 	ec.Bridge.Log.Info().Msg("Email connector stopped")
+}
+
+// registerOAuthListener stores the listener for the given user's MXID so the
+// paste-code command can find it. Replaces any previous entry — bridgev2
+// only runs one login process per user at a time, so a fresh `!matrimail
+// login` invalidates the previous listener anyway.
+func (ec *EmailConnector) registerOAuthListener(mxid string, l *OAuthListener) {
+	ec.oauthListenersMu.Lock()
+	defer ec.oauthListenersMu.Unlock()
+	if ec.oauthListeners == nil {
+		ec.oauthListeners = map[string]*OAuthListener{}
+	}
+	ec.oauthListeners[mxid] = l
+}
+
+// unregisterOAuthListener removes the stored listener iff it's still the same
+// instance — protects against a race where a fresh login replaced it before
+// the old one's defer ran.
+func (ec *EmailConnector) unregisterOAuthListener(mxid string, l *OAuthListener) {
+	ec.oauthListenersMu.Lock()
+	defer ec.oauthListenersMu.Unlock()
+	if ec.oauthListeners[mxid] == l {
+		delete(ec.oauthListeners, mxid)
+	}
+}
+
+// lookupOAuthListener returns the listener registered for the user, or nil if
+// none. Caller must not retain the pointer past the response — Wait/Cancel
+// can deregister concurrently.
+func (ec *EmailConnector) lookupOAuthListener(mxid string) *OAuthListener {
+	ec.oauthListenersMu.Lock()
+	defer ec.oauthListenersMu.Unlock()
+	return ec.oauthListeners[mxid]
 }
 
 // dedupAdapter is the connector-side glue that exposes SentDedupQuery.Exists

@@ -128,6 +128,31 @@ func (l *OAuthListener) RedirectURI() string {
 	return l.redirectURI
 }
 
+// Inject delivers a code/state pair to the listener as if it had arrived via
+// the loopback /callback endpoint. Used by the `!matrimail oauth paste-code`
+// admin command for headless deployments where the user's browser cannot
+// reach the bridge's loopback port at all (no SSH access for tunneling, etc).
+//
+// State is validated against expectState the same way handleCallback does it,
+// so a stale or forged code can't bypass CSRF protection just because it came
+// in via a bot command instead of HTTP. If a code has already been delivered
+// (real callback or earlier inject), this returns an error rather than
+// silently overwriting.
+func (l *OAuthListener) Inject(code, state string) error {
+	if state == "" || state != l.expectState {
+		return errors.New("oauth inject: state parameter does not match the active login (URL is from a stale session?)")
+	}
+	if code == "" {
+		return errors.New("oauth inject: empty code")
+	}
+	select {
+	case l.codeCh <- code:
+		return nil
+	default:
+		return errors.New("oauth inject: a code has already been delivered for this login")
+	}
+}
+
 // Wait blocks until either a valid callback arrives, the listener errors out
 // (timeout, server error, state mismatch), or ctx is cancelled.
 //

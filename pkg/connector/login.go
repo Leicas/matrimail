@@ -197,6 +197,7 @@ Custom IMAP servers - Auto-detected
 // goroutine.
 func (elp *EmailLoginProcess) Cancel() {
 	if elp.listener != nil {
+		elp.connector.unregisterOAuthListener(elp.user.MXID.String(), elp.listener)
 		elp.listener.Close()
 	}
 }
@@ -906,6 +907,8 @@ func (elp *EmailLoginProcess) handleOAuthEmail(ctx context.Context, input map[st
 		return nil, fmt.Errorf("start OAuth callback listener: %w", err)
 	}
 	elp.listener = listener
+	// Register so `!matrimail oauth paste-code` can find this listener.
+	elp.connector.registerOAuthListener(elp.user.MXID.String(), listener)
 
 	scopes := email.ScopesForMode(elp.scopeMode)
 	authURL, err := email.BuildAuthURL(
@@ -943,13 +946,24 @@ Scope mode: **%s**.%s
 
 🚧 *Headless server tip:* if your matrimail host has no browser, set up an SSH
 local port-forward from your workstation **before** opening the URL — see the
-prompt from Step 1.`,
+prompt from Step 1.
+
+🆘 *No SSH access either?* Open the URL anyway. After you click "Allow", your
+browser will fail to load the redirect ("can't connect to %s") — but the
+URL bar will contain the authorization code. Copy the **full URL** from the
+address bar and run:
+
+    !matrimail oauth paste-code <paste-the-url-here>
+
+The bridge has the matching state and PKCE verifier in memory and will finish
+the exchange.`,
 			listener.RedirectURI(),
 			authURL,
 			elp.email,
 			cfg.EffectiveCallbackTimeout().String(),
 			elp.scopeMode,
 			scopeNote,
+			listener.RedirectURI(),
 		),
 		DisplayAndWaitParams: &bridgev2.LoginDisplayAndWaitParams{
 			Type: bridgev2.LoginDisplayTypeCode,
@@ -970,9 +984,13 @@ func (elp *EmailLoginProcess) Wait(ctx context.Context) (*bridgev2.LoginStep, er
 		return nil, errors.New("OAuth wait called before listener start; this is a bridge bug")
 	}
 	code, err := elp.listener.Wait(ctx)
-	// Always release the port — listener has already shut down on success
-	// but Close() is idempotent.
-	defer elp.listener.Close()
+	// Always release the port and drop the registry entry — listener has
+	// already shut down on success but Close() is idempotent and the registry
+	// entry would otherwise dangle until the next login.
+	defer func() {
+		elp.connector.unregisterOAuthListener(elp.user.MXID.String(), elp.listener)
+		elp.listener.Close()
+	}()
 	if err != nil {
 		return nil, fmt.Errorf("OAuth authorization failed: %w", err)
 	}
@@ -988,12 +1006,16 @@ func (elp *EmailLoginProcess) handleOAuthWait(ctx context.Context, _ map[string]
 		return nil, errors.New("OAuth wait called before listener start; this is a bridge bug")
 	}
 	// Non-blocking peek: the listener delivers exactly once on success.
+	cleanup := func() {
+		elp.connector.unregisterOAuthListener(elp.user.MXID.String(), elp.listener)
+		elp.listener.Close()
+	}
 	select {
 	case code := <-elp.listenerCodeCh():
-		defer elp.listener.Close()
+		defer cleanup()
 		return elp.finishOAuthExchange(ctx, code)
 	case err := <-elp.listenerErrCh():
-		defer elp.listener.Close()
+		defer cleanup()
 		return nil, fmt.Errorf("OAuth authorization failed: %w", err)
 	default:
 		// Still waiting — re-show a "still waiting" message.

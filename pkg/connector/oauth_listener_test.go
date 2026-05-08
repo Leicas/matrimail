@@ -133,6 +133,148 @@ func TestOAuthListener_CloseIdempotent(t *testing.T) {
 	l.Close()
 }
 
+func TestOAuthListener_InjectHappyPath(t *testing.T) {
+	t.Parallel()
+	l, err := StartOAuthListener("127.0.0.1:0", "EXPECTED", 5*time.Second)
+	if err != nil {
+		t.Fatalf("StartOAuthListener: %v", err)
+	}
+	defer l.Close()
+
+	if err := l.Inject("THE_CODE", "EXPECTED"); err != nil {
+		t.Fatalf("Inject: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+	got, err := l.Wait(ctx)
+	if err != nil {
+		t.Fatalf("Wait after Inject: %v", err)
+	}
+	if got != "THE_CODE" {
+		t.Errorf("code = %q, want THE_CODE", got)
+	}
+}
+
+func TestOAuthListener_InjectStateMismatch(t *testing.T) {
+	t.Parallel()
+	l, err := StartOAuthListener("127.0.0.1:0", "EXPECTED", 5*time.Second)
+	if err != nil {
+		t.Fatalf("StartOAuthListener: %v", err)
+	}
+	defer l.Close()
+
+	if err := l.Inject("CODE", "WRONG"); err == nil {
+		t.Error("Inject with wrong state should error")
+	}
+	if err := l.Inject("CODE", ""); err == nil {
+		t.Error("Inject with empty state should error")
+	}
+	if err := l.Inject("", "EXPECTED"); err == nil {
+		t.Error("Inject with empty code should error")
+	}
+}
+
+func TestOAuthListener_InjectAfterDelivery(t *testing.T) {
+	t.Parallel()
+	l, err := StartOAuthListener("127.0.0.1:0", "S", 5*time.Second)
+	if err != nil {
+		t.Fatalf("StartOAuthListener: %v", err)
+	}
+	defer l.Close()
+
+	if err := l.Inject("FIRST", "S"); err != nil {
+		t.Fatalf("first Inject: %v", err)
+	}
+	// Channel is buffered size-1; second injection should fail rather than block.
+	if err := l.Inject("SECOND", "S"); err == nil {
+		t.Error("second Inject should error (already delivered)")
+	}
+}
+
+func TestParseOAuthCallbackURL(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name      string
+		raw       string
+		wantCode  string
+		wantState string
+		wantErr   bool
+	}{
+		{
+			name:      "full URL",
+			raw:       "http://127.0.0.1:40909/callback?code=4/0AY0e&state=yZ4EZsqS",
+			wantCode:  "4/0AY0e",
+			wantState: "yZ4EZsqS",
+		},
+		{
+			name:      "URL with extra params",
+			raw:       "http://127.0.0.1:8888/callback?state=S&code=C&scope=https://www.googleapis.com/auth/gmail.modify",
+			wantCode:  "C",
+			wantState: "S",
+		},
+		{
+			name:      "bare query with leading ?",
+			raw:       "?code=AAA&state=BBB",
+			wantCode:  "AAA",
+			wantState: "BBB",
+		},
+		{
+			name:      "bare query without leading ?",
+			raw:       "code=AAA&state=BBB",
+			wantCode:  "AAA",
+			wantState: "BBB",
+		},
+		{
+			name:      "path + query without scheme",
+			raw:       "/callback?code=AAA&state=BBB",
+			wantCode:  "AAA",
+			wantState: "BBB",
+		},
+		{
+			name:    "google access_denied error",
+			raw:     "http://127.0.0.1:8888/callback?error=access_denied&error_description=user+cancelled&state=S",
+			wantErr: true,
+		},
+		{
+			name:    "missing code",
+			raw:     "http://127.0.0.1:8888/callback?state=S",
+			wantErr: true,
+		},
+		{
+			name:    "missing state",
+			raw:     "http://127.0.0.1:8888/callback?code=C",
+			wantErr: true,
+		},
+		{
+			name:    "empty input",
+			raw:     "",
+			wantErr: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			code, state, err := parseOAuthCallbackURL(tc.raw)
+			if tc.wantErr {
+				if err == nil {
+					t.Errorf("expected error for %q, got code=%q state=%q", tc.raw, code, state)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error for %q: %v", tc.raw, err)
+			}
+			if code != tc.wantCode {
+				t.Errorf("code = %q, want %q", code, tc.wantCode)
+			}
+			if state != tc.wantState {
+				t.Errorf("state = %q, want %q", state, tc.wantState)
+			}
+		})
+	}
+}
+
 func TestIsLoopbackAddr(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
