@@ -1,3 +1,10 @@
+## [1.2.0](https://github.com/Leicas/matrimail/compare/v1.1.3...v1.2.0) (2026-05-08)
+
+
+### Features
+
+* **outbound:** append Gmail-side signature on new threads ([acd8e61](https://github.com/Leicas/matrimail/commit/acd8e61a764cba81457c57aef09f9498dac2888d))
+
 ## [1.1.3](https://github.com/Leicas/matrimail/compare/v1.1.2...v1.1.3) (2026-05-08)
 
 
