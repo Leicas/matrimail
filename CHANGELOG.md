@@ -1,3 +1,10 @@
+## [1.1.3](https://github.com/Leicas/matrimail/compare/v1.1.2...v1.1.3) (2026-05-08)
+
+
+### Bug Fixes
+
+* **db:** load auth_type in GetAccount + GetUserAccounts(Basic) ([030a434](https://github.com/Leicas/matrimail/commit/030a434f1c8f0209c7668456b3c142b970db476b))
+
 ## [1.1.2](https://github.com/Leicas/matrimail/compare/v1.1.1...v1.1.2) (2026-05-08)
 
 
