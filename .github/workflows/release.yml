@@ -8,11 +8,15 @@ name: Release
 #   4. Tags the release commit vX.Y.Z and pushes both the tag and the
 #      changelog commit back to main.
 #
-# When a new release is cut, this same job follows up by building the Docker
-# image with the new version tag and pushing it to GHCR. We do this inline
-# rather than via the existing docker.yml workflow because GitHub's anti-
-# recursion rule: tags created by GITHUB_TOKEN don't trigger downstream
-# `on: push: tags:` workflows. Inline keeps the release atomic.
+# When a new release is cut, two parallel build jobs (linux/amd64 + linux/arm64)
+# build the image on NATIVE runners — `ubuntu-latest` for amd64 and
+# `ubuntu-24.04-arm` for arm64 — to avoid QEMU emulation overhead. Each job
+# pushes its arch-specific layer by digest, then a final manifest job stitches
+# the two digests together into a single multi-arch manifest list with the
+# version / major.minor / latest tags. We do this inline rather than via the
+# existing docker.yml workflow because of GitHub's anti-recursion rule: tags
+# created by GITHUB_TOKEN don't trigger downstream `on: push: tags:` workflows.
+# Inline keeps the release atomic.
 #
 # Commit conventions (relevant prefixes for version bumps):
 #   feat:      → minor bump
@@ -40,8 +44,14 @@ env:
 
 jobs:
   release:
-    name: semantic-release + docker
+    name: semantic-release
     runs-on: ubuntu-latest
+    outputs:
+      new_release_published: ${{ steps.semantic.outputs.new_release_published }}
+      new_release_version: ${{ steps.semantic.outputs.new_release_version }}
+      new_release_major_version: ${{ steps.semantic.outputs.new_release_major_version }}
+      new_release_minor_version: ${{ steps.semantic.outputs.new_release_minor_version }}
+      image: ${{ steps.lc.outputs.image }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -95,28 +105,9 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # The Docker steps below are gated on a new release actually being
-      # published. No-op commits (chore:, docs:, ci:, etc.) won't bump the
-      # version → no need to rebuild the image.
-      - name: Set up QEMU
-        if: steps.semantic.outputs.new_release_published == 'true'
-        uses: docker/setup-qemu-action@v3
-
-      - name: Set up Docker Buildx
-        if: steps.semantic.outputs.new_release_published == 'true'
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GHCR
-        if: steps.semantic.outputs.new_release_published == 'true'
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
       # Docker requires lowercase image names. ${{ github.repository }}
       # preserves the repo's actual case (Leicas/matrimail), so we have to
-      # lowercase it here before passing to the build action.
+      # lowercase it here before passing to downstream build/manifest jobs.
       - name: Lowercase image name
         if: steps.semantic.outputs.new_release_published == 'true'
         id: lc
@@ -124,23 +115,124 @@ jobs:
         env:
           IMAGE_NAME: ${{ env.IMAGE_NAME }}
 
-      - name: Build & push versioned image
-        if: steps.semantic.outputs.new_release_published == 'true'
+  # Per-architecture build jobs. Each one runs natively (no QEMU), pushes its
+  # platform-specific image layers to GHCR by digest, and uploads the digest
+  # as an artifact for the manifest job to pick up.
+  #
+  # Cache scope is keyed per-arch so amd64 and arm64 don't fight over the same
+  # cache key in the GHA backend. The Dockerfile's BuildKit cache mounts are
+  # also arch-scoped via TARGETARCH, so the layered caching behaves correctly
+  # for both directions (registry layer cache + Go compile cache).
+  build:
+    name: Build & push (${{ matrix.platform }})
+    needs: release
+    if: needs.release.outputs.new_release_published == 'true'
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            cache_scope: amd64
+          - platform: linux/arm64
+            # GitHub-hosted ARM64 runners — GA on public repos (free) and on
+            # paid plans for private repos. Drops native build time from
+            # ~15-25 min (under QEMU on amd64) to ~2-5 min.
+            runner: ubuntu-24.04-arm
+            cache_scope: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Push by digest only at this stage — the final tags are applied in the
+      # manifest job after both arches have published their digests.
+      - name: Build & push by digest
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: true
-          # Three tags per release: the exact version, the major.minor (so
-          # downstream pinning is easier), and `latest`.
-          tags: |
-            ${{ env.REGISTRY }}/${{ steps.lc.outputs.image }}:${{ steps.semantic.outputs.new_release_version }}
-            ${{ env.REGISTRY }}/${{ steps.lc.outputs.image }}:${{ steps.semantic.outputs.new_release_major_version }}.${{ steps.semantic.outputs.new_release_minor_version }}
-            ${{ env.REGISTRY }}/${{ steps.lc.outputs.image }}:latest
+          platforms: ${{ matrix.platform }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.version=${{ steps.semantic.outputs.new_release_version }}
+            org.opencontainers.image.version=${{ needs.release.outputs.new_release_version }}
             org.opencontainers.image.revision=${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ needs.release.outputs.image }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.cache_scope }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.cache_scope }}
+
+      # Export the digest as an artifact so the manifest job can find it.
+      # Using one file per digest (named by digest) so the manifest job can
+      # glob them without parsing.
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.cache_scope }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # Stitch the per-arch digests into a single multi-platform manifest list and
+  # apply the consumer-facing tags (vX.Y.Z, X.Y, latest).
+  manifest:
+    name: Merge & push multi-arch manifest
+    needs: [release, build]
+    if: needs.release.outputs.new_release_published == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # `docker buildx imagetools create` reads the digest manifests already
+      # pushed by the per-arch build jobs and assembles them into a single
+      # multi-platform manifest list, applying all three tags atomically.
+      - name: Create multi-arch manifest
+        working-directory: /tmp/digests
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ needs.release.outputs.image }}
+          VERSION: ${{ needs.release.outputs.new_release_version }}
+          MAJOR: ${{ needs.release.outputs.new_release_major_version }}
+          MINOR: ${{ needs.release.outputs.new_release_minor_version }}
+        run: |
+          docker buildx imagetools create \
+            -t "$IMAGE:$VERSION" \
+            -t "$IMAGE:$MAJOR.$MINOR" \
+            -t "$IMAGE:latest" \
+            $(printf "$IMAGE@sha256:%s " *)
+
+      - name: Inspect manifest
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ needs.release.outputs.image }}
+          VERSION: ${{ needs.release.outputs.new_release_version }}
+        run: docker buildx imagetools inspect "$IMAGE:$VERSION"
