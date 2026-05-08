@@ -1,3 +1,10 @@
+## [1.1.0](https://github.com/Leicas/matrimail/compare/v1.0.1...v1.1.0) (2026-05-08)
+
+
+### Features
+
+* **oauth:** add paste-code command for fully-headless deploys ([66ba244](https://github.com/Leicas/matrimail/commit/66ba24464c58f83fcfb04239376a49a994d59ba5))
+
 ## [1.0.1](https://github.com/Leicas/matrimail/compare/v1.0.0...v1.0.1) (2026-05-07)
 
 
