@@ -19,6 +19,7 @@ import (
 	"maunium.net/go/mautrix/bridgev2/commands"
 	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/bridgev2/networkid"
+	"maunium.net/go/mautrix/event"
 )
 
 type EmailConnector struct {
@@ -507,6 +508,10 @@ func (ec *EmailConnector) GetChatInfo(ctx context.Context, portal *bridgev2.Port
 		Members: &bridgev2.ChatMemberList{
 			Members: chatMembers,
 			IsFull:  true,
+		},
+		// Match the room_manager fallback's tagging — see comment there.
+		UserLocal: &bridgev2.UserLocalPortalInfo{
+			Tag: ptr.Ptr(event.RoomTagLowPriority),
 		},
 	}
 

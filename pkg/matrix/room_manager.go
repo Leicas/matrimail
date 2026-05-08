@@ -99,6 +99,16 @@ func (rm *RoomManager) GetChatInfoForThread(ctx context.Context, thread *email.E
 			MemberMap:        memberMap,
 			PowerLevels:      powerLevels,
 		},
+		// Tag every matrimail portal as low-priority so Element / clients
+		// that respect tag-based filters can keep email threads out of the
+		// main "Home" view without affecting the user's other rooms. The
+		// framework only applies this if the operator has m.lowpriority in
+		// `bridge.only_bridge_tags`; combined with `bridge.tag_only_on_create:
+		// true` users can untag individual rooms without us re-tagging them
+		// on every restart.
+		UserLocal: &bridgev2.UserLocalPortalInfo{
+			Tag: ptr.Ptr(event.RoomTagLowPriority),
+		},
 		CanBackfill: true,
 	}
 
