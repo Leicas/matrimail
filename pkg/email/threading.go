@@ -331,8 +331,20 @@ func (tm *ThreadManager) addToExistingThread(thread *EmailThread, email *ParsedE
 	
 	// Update thread with current email participants (represents "active" participants)
 	// This affects who can see new messages
+	// Use the UNION of old + current participants, not just the current
+	// email's participants. Replacing with currentEmailParticipants alone
+	// loses the original other-party when a degenerate email lands in the
+	// thread — e.g. a Sent-folder echo of a self-sent reply, a BCC-only
+	// blast, or a message whose From/To headers don't parse to email
+	// addresses. With the latter the thread's participants would collapse
+	// to {self} (or empty), and every subsequent reply attempt would
+	// error out with "no recipients (thread participants empty after
+	// self-exclusion)".
+	//
+	// AddedParticipants / RemovedParticipants still reflect the per-email
+	// delta for Matrix room membership churn.
 	var activeParticipants []string
-	for participant := range currentEmailParticipants {
+	for participant := range allParticipants {
 		activeParticipants = append(activeParticipants, participant)
 	}
 	thread.Participants = activeParticipants
