@@ -190,11 +190,13 @@ func fnNuke(ce *commands.Event, connector *EmailConnector) {
 }
 
 func fnLogin(ce *commands.Event, connector *EmailConnector) {
-	// Check if user has any active logins
+	// Multi-account: a user can attach multiple email accounts. The DB primary key
+	// (user_mxid, email) prevents true duplicates, and the existing list/logout
+	// commands already iterate per-account. Surface the current state so the user
+	// knows they're adding rather than replacing, but don't block the new login.
 	logins := ce.User.GetUserLogins()
 	if len(logins) > 0 {
-		ce.Reply("✅ You're already logged into %d email account(s). Use `!matrimail list` to see them, or `!matrimail logout` to disconnect.", len(logins))
-		return
+		ce.Reply("ℹ️ You already have %d email account(s) connected — starting a new login to add another. Use `!matrimail list` to see existing accounts, or `!matrimail logout <email>` to remove one.", len(logins))
 	}
 
 	ctx := context.Background()

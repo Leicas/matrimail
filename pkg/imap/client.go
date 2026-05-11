@@ -1353,7 +1353,9 @@ func (c *Client) processMessageWith(ctx context.Context, cli *imapclient.Client,
 			return nil
 		}
 
-		// Process the message using the email processor, with a one-time degraded-parse retry
+		// Process the message using the email processor, with a one-time degraded-parse retry.
+		// Drafts (\Draft flag) are filtered inside parseIMAPFetchData and surface
+		// here as a (nil, nil) result, handled by the dedup-style nil-message skip below.
 		emailMessage, err := c.processor.ProcessIMAPMessage(ctx, msg, c.login, mailbox)
 		if err != nil {
 			// If processor reports a degraded parse (missing From/Message-ID), try a short retry

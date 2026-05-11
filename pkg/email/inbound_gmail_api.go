@@ -246,11 +246,19 @@ func (g *GmailHistoryPoller) pollOnce(ctx context.Context, cursor uint64, logger
 
 	// Build a deduped set of new message IDs. messageAdded entries can repeat
 	// across history records (e.g. label-add then mark-read on the same msg).
+	// Drafts (DRAFT label) are skipped — they don't have stable Message-IDs
+	// and would otherwise appear in Matrix as messages from a third-party
+	// ghost. The user composes drafts in Gmail; they only become visible in
+	// Matrix once actually sent (at which point Gmail removes DRAFT).
 	newMsgIDs := map[string]string{} // messageId → primary label (best-effort)
 	for _, page := range pages {
 		for _, h := range page.History {
 			for _, ma := range h.MessagesAdded {
 				if ma == nil || ma.Message == nil || ma.Message.Id == "" {
+					continue
+				}
+				if hasLabel(ma.Message.LabelIds, "DRAFT") {
+					logger.Debug().Str("gmail_msg_id", ma.Message.Id).Msg("Skipping draft message (DRAFT label)")
 					continue
 				}
 				lbl := primaryLabel(ma.Message.LabelIds, g.MonitoredLabelIDs)
@@ -305,6 +313,18 @@ func isHistoryExpiredError(err error) bool {
 	}
 	msg := err.Error()
 	return strings.Contains(msg, "historyId") && strings.Contains(strings.ToLower(msg), "not found")
+}
+
+// hasLabel reports whether labels contains target (case-insensitive). Used to
+// detect Gmail system labels like DRAFT, SENT, INBOX without depending on
+// label-ID order.
+func hasLabel(labels []string, target string) bool {
+	for _, l := range labels {
+		if strings.EqualFold(l, target) {
+			return true
+		}
+	}
+	return false
 }
 
 // primaryLabel picks the most-specific monitored label for a message. If the

@@ -175,6 +175,11 @@ type ParsedEmail struct {
 	TextContent string
 	HTMLContent string
 	Attachments []*EmailAttachment
+	// IsDraft is set when the source message carries the IMAP \Draft flag.
+	// ProcessIMAPMessage uses this to drop drafts before they leak into the
+	// Matrix room — drafts have unstable Message-IDs and self-From, which
+	// otherwise makes them appear in Matrix as "a reply by someone".
+	IsDraft bool
 }
 
 

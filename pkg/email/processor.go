@@ -121,6 +121,16 @@ func (p *Processor) ProcessIMAPMessage(ctx context.Context, fetchData *imapclien
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse IMAP fetch data: %w", err)
 	}
+	// Drafts are skipped: they have unstable Message-IDs (re-generated on every
+	// save) and a self-From address that causes them to surface in Matrix as
+	// messages from a third-party ghost — i.e. "a reply by someone" — rather
+	// than as drafts. The user composes drafts in their email client; they
+	// only appear in Matrix once actually sent (at which point the \Draft flag
+	// is gone and the message takes a normal Message-ID).
+	if parsedEmail.IsDraft {
+		p.log.Debug().Str("message_id", parsedEmail.MessageID).Str("mailbox", mailbox).Msg("Skipping draft message (\\Draft flag)")
+		return nil, nil
+	}
 	return p.ProcessParsedEmail(ctx, parsedEmail, userLogin, mailbox)
 }
 
@@ -258,6 +268,15 @@ func (p *Processor) parseIMAPFetchData(fetchData *imapclient.FetchMessageData) (
 	parsedEmail := &ParsedEmail{
 		MessageID: fmt.Sprintf("uid-%d", buf.UID), // Fallback if no Message-ID found
 		Date:     time.Now(), // Fallback if no date found
+	}
+
+	// Surface the \Draft flag so ProcessIMAPMessage can drop drafts before
+	// they leak into the Matrix room.
+	for _, f := range buf.Flags {
+		if f == imap.FlagDraft {
+			parsedEmail.IsDraft = true
+			break
+		}
 	}
 
 	// Extract data from envelope if available
@@ -631,16 +650,21 @@ mr := multipart.NewReader(body, boundary)
 			}
 		}
 
-		// Filter out tiny placeholder/spacer images for inline images only
+		// Filter out tracking pixels / spacer images for inline images only.
+		// Real tracking pixels are typically 1x1 or 2x2 transparent GIFs (~50–
+		// 200 bytes). The previous 1 KB threshold was wide enough to also drop
+		// legitimate small inline icons (favicons, signature glyphs, small logos
+		// — typically 300 bytes to a few KB), which made signature-block images
+		// disappear from rendered emails. 256 bytes catches essentially all
+		// real tracking pixels while preserving real content.
 		if isInlineReference && strings.HasPrefix(strings.ToLower(mediaType), "image/") {
-			// Skip images under 1KB - these are typically spacers/placeholders
-			if len(dataBytes) < 1024 {
+			if len(dataBytes) < 256 {
 				p.log.Debug().
 					Str("filename", filename).
 					Str("content_type", ct).
 					Int("size", len(dataBytes)).
 					Str("cid", contentID).
-					Msg("Filtered out placeholder image (< 1KB)")
+					Msg("Filtered out tracking-pixel-sized image (< 256B)")
 				continue
 			}
 		}
@@ -973,14 +997,20 @@ func (e *EmailMatrixEvent) ConvertMessage(ctx context.Context, portal *bridgev2.
 			alt := strings.TrimSpace(extractAttr(tag, "alt"))
 			if alt == "" { alt = strings.TrimSpace(extractAttr(tag, "title")) }
 			low := strings.ToLower(src)
-			// Helper to add an inline meta and return placeholder
-add := func(mxc id.ContentURIString, mime string, sz int, defaultLabel string) string {
+			// Helper: record the inline image meta (used by the plain-text
+			// fallback and by the sidecar emission below) and emit an <img>
+			// tag pointing at the uploaded mxc URI inline. Element renders
+			// mxc img tags in formatted_body natively, so this gives proper
+			// inline image display rather than a "[Image N: label]" text stub.
+			add := func(mxc id.ContentURIString, mime string, sz int, defaultLabel string) string {
 				label := defaultLabel
 				if alt != "" { label = alt }
 				meta := &InlineImageMeta{Index: nextIndex, Label: label, MXC: mxc, Mime: mime, Size: sz}
 				inlineImages = append(inlineImages, meta)
 				nextIndex++
-				return fmt.Sprintf("[Image %d: %s]", meta.Index, meta.Label)
+				// HTML-escape the alt text so a hostile filename can't break out of the attribute.
+				safeAlt := html.EscapeString(label)
+				return fmt.Sprintf(`<img src="%s" alt="%s">`, string(mxc), safeAlt)
 			}
 			// Remote images: never fetch, remove placeholders entirely to reduce clutter
 			if strings.HasPrefix(low, "http:") || strings.HasPrefix(low, "https:") {
@@ -1252,17 +1282,25 @@ parts = append(parts, &bridgev2.ConvertedMessagePart{ID: networkid.PartID(pid), 
 		}
 	}
 
-	// Emit sidecar image messages for inline images in document order
-	for _, im := range inlineImages {
-		pid := fmt.Sprintf("inline-image-%d", im.Index)
-		// Build image content
-imgContent := &event.MessageEventContent{
-			MsgType: event.MsgImage,
-			Body:    fmt.Sprintf("Image %d: %s", im.Index, im.Label),
-			URL:     im.MXC,
+	// Emit sidecar image messages for inline images in document order, BUT
+	// only when the HTML formatted_body was dropped (size constraints) or
+	// never existed — otherwise the inline <img src="mxc://..."> tags inside
+	// formatted_body already render the image in Element, and emitting a
+	// sidecar m.image event on top creates a duplicate "image card" below
+	// the body. Keeping the sidecar as a fallback means HTML-stripped events
+	// and plain-text-only Matrix clients still see the image.
+	emitSidecars := content.FormattedBody == ""
+	if emitSidecars {
+		for _, im := range inlineImages {
+			pid := fmt.Sprintf("inline-image-%d", im.Index)
+			imgContent := &event.MessageEventContent{
+				MsgType: event.MsgImage,
+				Body:    fmt.Sprintf("Image %d: %s", im.Index, im.Label),
+				URL:     im.MXC,
+			}
+			imgContent.Info = &event.FileInfo{MimeType: im.Mime, Size: im.Size}
+			parts = append(parts, &bridgev2.ConvertedMessagePart{ID: networkid.PartID(pid), Type: event.EventMessage, Content: imgContent})
 		}
-		imgContent.Info = &event.FileInfo{MimeType: im.Mime, Size: im.Size}
-		parts = append(parts, &bridgev2.ConvertedMessagePart{ID: networkid.PartID(pid), Type: event.EventMessage, Content: imgContent})
 	}
 
 // Process attachments and upload them to Matrix (skip those used inline)
