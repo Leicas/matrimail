@@ -1,3 +1,10 @@
+## [1.4.0](https://github.com/Leicas/matrimail/compare/v1.3.0...v1.4.0) (2026-05-11)
+
+
+### Features
+
+* multi-account login, inline images, draft filtering ([8ffddfe](https://github.com/Leicas/matrimail/commit/8ffddfe82fc3047a748d5ae81e519f697afa6b04))
+
 ## [1.3.0](https://github.com/Leicas/matrimail/compare/v1.2.2...v1.3.0) (2026-05-08)
 
 
