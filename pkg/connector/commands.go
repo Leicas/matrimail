@@ -2,6 +2,7 @@ package connector
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net/url"
@@ -10,10 +11,14 @@ import (
 	"strings"
 	"time"
 
+	"github.com/rs/zerolog"
 	gmail "google.golang.org/api/gmail/v1"
 	"google.golang.org/api/option"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/commands"
+	"maunium.net/go/mautrix/event"
+	"maunium.net/go/mautrix/format"
+	"maunium.net/go/mautrix/id"
 
 	"github.com/Leicas/matrimail/pkg/email"
 	"github.com/Leicas/matrimail/pkg/imap"
@@ -1599,14 +1604,233 @@ func fnDraft(ce *commands.Event, connector *EmailConnector) {
 		return
 	}
 
-	msg := "✏️ Draft requested — check Gmail in a moment."
+	// Status line — short ack that the workflow was queued.
+	status := "✏️ Draft requested — agent is researching context; the draft will appear here when ready (~30-90s)."
 	if resp != nil && strings.TrimSpace(resp.Message) != "" {
-		msg = fmt.Sprintf("✏️ %s", strings.TrimSpace(resp.Message))
+		status = fmt.Sprintf("✏️ %s", strings.TrimSpace(resp.Message))
 	}
 	if req.Instruction != "" {
-		msg += fmt.Sprintf("\n\n_Instruction:_ %s", req.Instruction)
+		status += fmt.Sprintf("\n_Instruction:_ %s", req.Instruction)
 	}
-	ce.Reply(msg)
+	ce.Reply(status)
+
+	// Background poll: the n8n workflow ack'd fast (fire-and-forget) but the
+	// actual draft creation happens after that — typically 30-90s for the AI
+	// agent. Once it lands in Gmail, fetch the body and post it into THIS
+	// portal so the user can review it in Element without leaving the room.
+	go pollAndPostGmailDraft(connector, ce, client.Email, req.ThreadID, req.MessageID)
+}
+
+// pollAndPostGmailDraft watches Gmail for a draft on the given thread for
+// up to ~3 minutes, then posts its body as a bot message in the portal
+// where the !draft command was run. Best-effort — errors are logged but
+// never surface to the user.
+func pollAndPostGmailDraft(connector *EmailConnector, ce *commands.Event, emailAddr, threadHint, messageHint string) {
+	logger := connector.Bridge.Log.With().
+		Str("component", "draft_poll").
+		Str("email", emailAddr).
+		Str("room", string(ce.Portal.MXID)).
+		Logger()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	defer cancel()
+
+	// Get OAuth account info for this email.
+	info, err := connector.DB.GetOAuthAccount(ctx, ce.User.MXID.String(), emailAddr)
+	if err != nil || info == nil || info.Token == nil {
+		logger.Warn().Err(err).Msg("Draft poll: no OAuth token; can't query Gmail")
+		return
+	}
+	oauthCfg := email.GmailOAuthConfig{
+		ClientID:     connector.Config.GmailOAuth.ClientID,
+		ClientSecret: connector.Config.GmailOAuth.ClientSecret,
+	}
+	ts := email.TokenSource(context.Background(), oauthCfg, info.Token)
+	svc, err := gmail.NewService(ctx, option.WithTokenSource(ts))
+	if err != nil {
+		logger.Warn().Err(err).Msg("Draft poll: gmail.NewService failed")
+		return
+	}
+
+	// Resolve the RFC822 message-id we sent to n8n into a Gmail internal
+	// thread id. messages.list with q=rfc822msgid:<id> is the canonical way.
+	resolveTry := func(msgID string) (string, error) {
+		q := "rfc822msgid:" + strings.Trim(msgID, "<> \t")
+		resp, lerr := svc.Users.Messages.List("me").Q(q).MaxResults(1).Context(ctx).Do()
+		if lerr != nil {
+			return "", lerr
+		}
+		if len(resp.Messages) == 0 {
+			return "", nil
+		}
+		return resp.Messages[0].ThreadId, nil
+	}
+	gmailThreadID, _ := resolveTry(messageHint)
+	if gmailThreadID == "" && threadHint != "" && threadHint != messageHint {
+		gmailThreadID, _ = resolveTry(threadHint)
+	}
+	if gmailThreadID == "" {
+		logger.Warn().Str("hint", messageHint).Msg("Draft poll: could not resolve Gmail thread id; aborting")
+		return
+	}
+	logger.Debug().Str("gmail_thread_id", gmailThreadID).Msg("Draft poll: resolved thread id, watching for draft")
+
+	// Poll every 15s, up to 12 times (~3 minutes total). The AI agent
+	// typically completes in 30-90s; this gives a generous buffer.
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+	// Initial short delay before first poll — drafts take at least a few
+	// seconds to land even on the fastest paths.
+	select {
+	case <-ctx.Done():
+		return
+	case <-time.After(20 * time.Second):
+	}
+
+	var lastDraftRev int64 // internalDate of the last draft we posted
+	tries := 0
+	for {
+		tries++
+		thread, terr := svc.Users.Threads.Get("me", gmailThreadID).Format("full").Context(ctx).Do()
+		if terr != nil {
+			logger.Warn().Err(terr).Int("try", tries).Msg("Draft poll: threads.get failed; retrying")
+		} else {
+			latest := pickLatestDraft(thread.Messages)
+			if latest != nil && latest.InternalDate > lastDraftRev {
+				body := extractGmailMessageText(latest)
+				if strings.TrimSpace(body) != "" {
+					postDraftToRoom(ctx, connector, ce.Portal.MXID, body, latest, &logger)
+					lastDraftRev = latest.InternalDate
+					return // one draft is enough; stop polling
+				}
+			}
+		}
+		if tries >= 12 {
+			logger.Info().Msg("Draft poll: no draft seen after 3 minutes; giving up")
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+// pickLatestDraft returns the message in the thread that carries the DRAFT
+// label and has the highest internalDate; nil if no draft is present.
+func pickLatestDraft(msgs []*gmail.Message) *gmail.Message {
+	var latest *gmail.Message
+	for _, m := range msgs {
+		isDraft := false
+		for _, l := range m.LabelIds {
+			if strings.EqualFold(l, "DRAFT") {
+				isDraft = true
+				break
+			}
+		}
+		if !isDraft {
+			continue
+		}
+		if latest == nil || m.InternalDate > latest.InternalDate {
+			latest = m
+		}
+	}
+	return latest
+}
+
+// extractGmailMessageText pulls text/plain out of a Gmail message payload.
+// Falls back to a tag-stripped text/html part, then to the snippet.
+func extractGmailMessageText(m *gmail.Message) string {
+	if m == nil {
+		return ""
+	}
+	if m.Payload != nil {
+		if txt := walkGmailPart(m.Payload, "text/plain"); txt != "" {
+			return txt
+		}
+		if html := walkGmailPart(m.Payload, "text/html"); html != "" {
+			// Strip tags (rough but adequate for review-in-Matrix).
+			out := html
+			for {
+				start := strings.Index(out, "<")
+				if start < 0 {
+					break
+				}
+				end := strings.Index(out[start:], ">")
+				if end < 0 {
+					break
+				}
+				out = out[:start] + " " + out[start+end+1:]
+			}
+			return strings.TrimSpace(out)
+		}
+	}
+	return strings.TrimSpace(m.Snippet)
+}
+
+func walkGmailPart(p *gmail.MessagePart, want string) string {
+	if p == nil {
+		return ""
+	}
+	if strings.EqualFold(p.MimeType, want) && p.Body != nil && p.Body.Data != "" {
+		// Gmail uses URL-safe base64.
+		s := strings.ReplaceAll(p.Body.Data, "-", "+")
+		s = strings.ReplaceAll(s, "_", "/")
+		// Pad
+		if pad := len(s) % 4; pad != 0 {
+			s += strings.Repeat("=", 4-pad)
+		}
+		raw, err := base64.StdEncoding.DecodeString(s)
+		if err != nil {
+			return ""
+		}
+		return string(raw)
+	}
+	for _, sub := range p.Parts {
+		if t := walkGmailPart(sub, want); t != "" {
+			return t
+		}
+	}
+	return ""
+}
+
+// postDraftToRoom renders the draft body as a blockquoted bot message and
+// sends it into the portal room.
+func postDraftToRoom(ctx context.Context, connector *EmailConnector, roomID id.RoomID, body string, m *gmail.Message, logger *zerolog.Logger) {
+	intent := connector.Bridge.Bot
+	if intent == nil {
+		logger.Warn().Msg("Draft poll: bridge bot intent unavailable")
+		return
+	}
+
+	// Header — pull subject from headers.
+	subject := ""
+	if m != nil && m.Payload != nil {
+		for _, h := range m.Payload.Headers {
+			if strings.EqualFold(h.Name, "Subject") {
+				subject = h.Value
+				break
+			}
+		}
+	}
+
+	header := "**📝 Draft reply**"
+	if subject != "" {
+		header = fmt.Sprintf("**📝 Draft reply** — `%s`", subject)
+	}
+
+	body = strings.TrimSpace(body)
+	quoted := "> " + strings.ReplaceAll(body, "\n", "\n> ")
+	md := header + "\n\n" + quoted + "\n\n_The draft is also saved in Gmail; edit and send from there._"
+
+	content := format.RenderMarkdown(md, true, false)
+	content.MsgType = event.MsgNotice
+	if _, err := intent.SendMessage(ctx, roomID, event.EventMessage, &event.Content{Parsed: &content}, nil); err != nil {
+		logger.Warn().Err(err).Msg("Draft poll: SendMessage to portal failed")
+		return
+	}
+	logger.Info().Str("subject", subject).Int("body_len", len(body)).Msg("Draft posted to portal")
 }
 
 // backlogMaxDays caps how far back the !matrimail backlog command will scan.

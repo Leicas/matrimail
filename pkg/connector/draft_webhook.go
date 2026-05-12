@@ -38,11 +38,17 @@ type DraftRequest struct {
 }
 
 // DraftResponse is the loosely-typed envelope we accept from the webhook.
-// We only surface `status` and `message` back to the user; everything else
-// is ignored.
+// `status` and `message` are surfaced as a short bot reply; `draft_body`
+// (when present) is posted as a separate, longer bot message in the room
+// so the user can read/copy the proposed reply directly in Element.
+// `language` is appended to the short reply for quick visibility.
 type DraftResponse struct {
-	Status  string `json:"status,omitempty"`
-	Message string `json:"message,omitempty"`
+	Status    string `json:"status,omitempty"`
+	Message   string `json:"message,omitempty"`
+	DraftBody string `json:"draft_body,omitempty"`
+	Subject   string `json:"subject,omitempty"`
+	Summary   string `json:"summary,omitempty"`
+	Language  string `json:"language,omitempty"`
 }
 
 // triggerDraftWebhook POSTs the JSON-encoded req to cfg.URL with an optional
