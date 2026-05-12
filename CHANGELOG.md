@@ -1,3 +1,10 @@
+## [1.7.0](https://github.com/Leicas/matrimail/compare/v1.6.1...v1.7.0) (2026-05-12)
+
+
+### Features
+
+* **draft:** post Gmail draft body into the portal room ([ade5141](https://github.com/Leicas/matrimail/commit/ade514136f4dc519f6358db3ab07ea2b7af3cac9))
+
 ## [1.6.1](https://github.com/Leicas/matrimail/compare/v1.6.0...v1.6.1) (2026-05-12)
 
 
