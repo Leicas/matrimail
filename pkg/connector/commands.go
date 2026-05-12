@@ -1531,19 +1531,60 @@ func fnDraft(ce *commands.Event, connector *EmailConnector) {
 		return
 	}
 
-	meta, _ := ce.Portal.Metadata.(*PortalMetadata)
 	req := DraftRequest{
 		Account:  client.Email,
 		UserMXID: ce.User.MXID.String(),
 		Source:   "command",
 		RoomID:   string(ce.Portal.MXID),
 	}
-	if meta != nil {
+
+	// Layer 1: persisted Portal.Metadata. Only populated for compose threads
+	// (`!matrimail compose`) and for portals that have produced at least one
+	// outbound send (`client_send.go` writes it post-send). Pure inbound-only
+	// rooms have nil metadata.
+	if meta, ok := ce.Portal.Metadata.(*PortalMetadata); ok && meta != nil {
 		req.ThreadID = meta.ThreadID
 		req.MessageID = meta.LastMessageID
 		req.Subject = meta.Subject
 		req.Participants = meta.Participants
 	}
+
+	// Layer 2: in-memory ThreadManager. Has fresh data for any thread that
+	// received a message in the last 24h. Use it to backfill anything the
+	// portal metadata didn't have (or wasn't there at all).
+	if connector.ThreadManager != nil {
+		threadID := strings.TrimPrefix(string(ce.Portal.ID), "thread:")
+		if threadID != "" {
+			if thread := connector.ThreadManager.GetThreadByID(string(ce.Portal.Receiver), threadID); thread != nil {
+				if req.ThreadID == "" {
+					req.ThreadID = thread.ThreadID
+				}
+				if req.MessageID == "" {
+					req.MessageID = thread.MessageID
+				}
+				if req.Subject == "" {
+					req.Subject = thread.Subject
+				}
+				if len(req.Participants) == 0 && len(thread.Participants) > 0 {
+					req.Participants = append([]string(nil), thread.Participants...)
+				}
+			}
+		}
+	}
+
+	// Layer 3: at minimum, derive ThreadID from the portal ID so n8n always
+	// has something to query Gmail with (the bridge encodes the RFC822 root
+	// Message-Id as `thread:<id>` in MakePortalID).
+	if req.ThreadID == "" {
+		req.ThreadID = strings.TrimPrefix(string(ce.Portal.ID), "thread:")
+	}
+	// If we still don't have a per-message id, fall back to the thread id —
+	// downstream rfc822msgid lookup will find at least the root message and
+	// Gmail's thread API picks up the rest.
+	if req.MessageID == "" {
+		req.MessageID = req.ThreadID
+	}
+
 	if len(ce.Args) > 0 {
 		req.Instruction = strings.TrimSpace(strings.Join(ce.Args, " "))
 	}
