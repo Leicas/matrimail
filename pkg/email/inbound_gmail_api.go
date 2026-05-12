@@ -26,10 +26,12 @@ import (
 //     the current historyId and persist it as the cursor — we only ingest
 //     forward from "now", not the entire mailbox history.
 //   - Every PollInterval, call users.history.list(startHistoryId=cursor,
-//     historyTypes=messageAdded, labelId=monitored). For each new messageId,
-//     fetch via users.messages.get(format=full) and hand the gmail.Message
-//     to the per-message callback (which builds a ParsedEmail and feeds the
-//     processor).
+//     historyTypes=[messageAdded,labelAdded], labelId=monitored). For each
+//     new messageId, fetch via users.messages.get(format=full) and hand the
+//     gmail.Message to the per-message callback (which builds a ParsedEmail
+//     and feeds the processor). labelAdded is required so that post-arrival
+//     tagging (e.g. a separate Gmail filter or n8n workflow that applies the
+//     monitored label after delivery) is still surfaced to Matrix.
 //   - Persist the new historyId after each successful tick.
 //
 // Errors during a tick are logged and the cursor stays put — the next tick
@@ -197,7 +199,7 @@ func (g *GmailHistoryPoller) pollOnce(ctx context.Context, cursor uint64, logger
 
 	call := svc.Users.History.List("me").
 		StartHistoryId(cursor).
-		HistoryTypes("messageAdded").
+		HistoryTypes("messageAdded", "labelAdded").
 		Context(ctx)
 	for _, lblID := range g.MonitoredLabelIDs {
 		call = call.LabelId(lblID)
@@ -229,11 +231,15 @@ func (g *GmailHistoryPoller) pollOnce(ctx context.Context, cursor uint64, logger
 	// Drain it so we don't lose events between ticks.
 	pages := []*gmail.ListHistoryResponse{resp}
 	for resp.NextPageToken != "" {
-		next, err := svc.Users.History.List("me").
+		nextCall := svc.Users.History.List("me").
 			StartHistoryId(cursor).
-			HistoryTypes("messageAdded").
+			HistoryTypes("messageAdded", "labelAdded").
 			PageToken(resp.NextPageToken).
-			Context(ctx).Do()
+			Context(ctx)
+		for _, lblID := range g.MonitoredLabelIDs {
+			nextCall = nextCall.LabelId(lblID)
+		}
+		next, err := nextCall.Do()
 		if err != nil {
 			return newCursor, fmt.Errorf("history.list pagination: %w", err)
 		}
@@ -244,8 +250,20 @@ func (g *GmailHistoryPoller) pollOnce(ctx context.Context, cursor uint64, logger
 		resp = next
 	}
 
-	// Build a deduped set of new message IDs. messageAdded entries can repeat
-	// across history records (e.g. label-add then mark-read on the same msg).
+	// Build a deduped set of new message IDs. Entries can repeat across history
+	// records (e.g. label-add then mark-read on the same msg). Two event types
+	// feed this set:
+	//
+	//   - messagesAdded: the message was just delivered with a monitored label
+	//     already applied (server-side filter, immediate-on-arrival labeling).
+	//   - labelsAdded:   a monitored label was applied to an existing message
+	//     after delivery (n8n classification workflow, user manual tag, etc.).
+	//     We only count this if the newly-added labels intersect the monitored
+	//     set — the labelId filter on history.list matches messages that
+	//     currently have a monitored label, so it can also surface labelAdded
+	//     events where some unrelated label was added to an already-monitored
+	//     message; we don't want to re-forward in that case.
+	//
 	// Drafts (DRAFT label) are skipped — they don't have stable Message-IDs
 	// and would otherwise appear in Matrix as messages from a third-party
 	// ghost. The user composes drafts in Gmail; they only become visible in
@@ -263,6 +281,22 @@ func (g *GmailHistoryPoller) pollOnce(ctx context.Context, cursor uint64, logger
 				}
 				lbl := primaryLabel(ma.Message.LabelIds, g.MonitoredLabelIDs)
 				newMsgIDs[ma.Message.Id] = lbl
+			}
+			for _, la := range h.LabelsAdded {
+				if la == nil || la.Message == nil || la.Message.Id == "" {
+					continue
+				}
+				if hasLabel(la.Message.LabelIds, "DRAFT") {
+					logger.Debug().Str("gmail_msg_id", la.Message.Id).Msg("Skipping draft message (DRAFT label) on labelsAdded")
+					continue
+				}
+				if !anyLabelMatches(la.LabelIds, g.MonitoredLabelIDs) {
+					continue
+				}
+				if _, alreadyQueued := newMsgIDs[la.Message.Id]; alreadyQueued {
+					continue
+				}
+				newMsgIDs[la.Message.Id] = primaryLabel(la.Message.LabelIds, g.MonitoredLabelIDs)
 			}
 		}
 	}
@@ -322,6 +356,21 @@ func hasLabel(labels []string, target string) bool {
 	for _, l := range labels {
 		if strings.EqualFold(l, target) {
 			return true
+		}
+	}
+	return false
+}
+
+// anyLabelMatches reports whether any element of a equals any element of b
+// (case-insensitive). Used to test whether a labelsAdded event added a
+// monitored label, vs adding some unrelated label to an already-monitored
+// message.
+func anyLabelMatches(a, b []string) bool {
+	for _, x := range a {
+		for _, y := range b {
+			if strings.EqualFold(x, y) {
+				return true
+			}
 		}
 	}
 	return false
