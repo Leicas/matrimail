@@ -18,8 +18,42 @@ type Config struct {
 	// GmailOAuth holds the user-provided "Desktop app" OAuth 2.0 client
 	// credentials used for the device-code login flow on Gmail accounts.
 	GmailOAuth GmailOAuthConfig `yaml:"gmail_oauth"`
+	// DraftWebhook configures the optional external trigger used by the
+	// `!matrimail draft` command (and the reaction trigger, once enabled) to
+	// ask an out-of-process workflow — typically an n8n LLM-draft flow — to
+	// generate a Gmail draft for a given thread. When URL is empty the
+	// command short-circuits with an "unconfigured" error.
+	DraftWebhook DraftWebhookConfig `yaml:"draft_webhook"`
 	// Keep Network for internal use but don't map to YAML
 	Network NetworkConfig `yaml:"-"`
+}
+
+// DraftWebhookConfig is the on-disk shape of the draft_webhook: block.
+type DraftWebhookConfig struct {
+	// URL of the HTTP endpoint (typically an n8n webhook) to POST a JSON
+	// payload to when the user runs !matrimail draft. Empty disables the
+	// feature; the command will report "not configured" instead of firing.
+	URL string `yaml:"url"`
+
+	// Secret is an optional bearer token sent in the Authorization header
+	// (`Authorization: Bearer <secret>`). Use this if the webhook is on the
+	// public internet — the endpoint should reject requests without it.
+	Secret string `yaml:"secret"`
+
+	// TimeoutSeconds bounds how long matrimail waits for the webhook to
+	// respond before giving up. Default 10. The webhook is expected to be
+	// fire-and-forget from matrimail's perspective: n8n acknowledges quickly,
+	// then does the actual LLM call + Gmail draft creation asynchronously.
+	TimeoutSeconds int `yaml:"timeout_seconds"`
+}
+
+// EffectiveTimeout returns the configured webhook timeout with a sane
+// default (10s) applied when zero or negative.
+func (d DraftWebhookConfig) EffectiveTimeout() time.Duration {
+	if d.TimeoutSeconds <= 0 {
+		return 10 * time.Second
+	}
+	return time.Duration(d.TimeoutSeconds) * time.Second
 }
 
 // GmailOAuthConfig is the on-disk shape of the gmail_oauth: block. The
@@ -131,6 +165,11 @@ func upgradeConfig(helper up.Helper) {
 	helper.Copy(up.Str, "gmail_oauth", "listener_address")
 	helper.Copy(up.Str, "gmail_oauth", "default_scope_mode")
 	helper.Copy(up.Int, "gmail_oauth", "callback_timeout_seconds")
+
+	// Draft webhook (optional external trigger for !matrimail draft).
+	helper.Copy(up.Str, "draft_webhook", "url")
+	helper.Copy(up.Str, "draft_webhook", "secret")
+	helper.Copy(up.Int, "draft_webhook", "timeout_seconds")
 }
 
 func (ec *EmailConnector) GetConfig() (string, any, up.Upgrader) {

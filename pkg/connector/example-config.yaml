@@ -78,3 +78,21 @@ gmail_oauth:
     # Optional: how long the loopback listener waits for the user's browser
     # callback before timing out. Default 600 (10 minutes).
     callback_timeout_seconds: 600
+
+# Optional: external draft-generation webhook (e.g. n8n). When `url` is set,
+# users can run `!matrimail draft` inside any portal room to fire an HTTP POST
+# to this URL with the thread's Gmail context (account email, thread ID, latest
+# Message-ID, subject, participants). The receiving workflow is expected to
+# fetch the message, run an LLM, and write the draft back to Gmail — matrimail
+# fires-and-forgets after acknowledging the response.
+#
+# Leave url empty to disable; the command will reply "not configured" instead.
+draft_webhook:
+    # Full URL of the webhook (HTTPS recommended for non-loopback).
+    url: ""
+    # Optional bearer token. When set, matrimail sends
+    #   Authorization: Bearer <secret>
+    # The receiving endpoint should reject requests without it.
+    secret: ""
+    # Optional timeout for the POST in seconds. Default 10.
+    timeout_seconds: 10

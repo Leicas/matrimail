@@ -357,6 +357,16 @@ func (ec *EmailConnector) createCommands() []commands.CommandHandler {
 				Args:        `[days] [email]`,
 			},
 		},
+		&commands.FullHandler{
+			Func: func(ce *commands.Event) { fnDraft(ce, ec) },
+			Name: "draft",
+			Help: commands.HelpMeta{
+				Section:     HelpSectionInfo,
+				Description: "Ask the configured external workflow (e.g. n8n) to generate a Gmail draft reply for this thread. Run from inside the thread's portal room. Extra words are forwarded as an instruction.",
+				Args:        `[instruction…]`,
+			},
+			RequiresPortal: true,
+		},
 	}
 }
 

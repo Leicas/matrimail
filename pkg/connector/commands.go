@@ -1497,6 +1497,77 @@ locally. To use this account again, run `+"`!matrimail login`"+`. To delete it
 entirely, run `+"`!matrimail logout %s`"+`.`, emailAddr, emailAddr)
 }
 
+// fnDraft fires the configured draft webhook (typically an n8n flow) for the
+// thread that owns the room the command was run in. Any extra args after
+// `draft` are joined and forwarded as a free-form Instruction the workflow
+// can interpret (e.g. "ask if Friday works", "decline politely").
+//
+// Requires: command must be run from a portal room (not the management room),
+// and draft_webhook.url must be configured.
+func fnDraft(ce *commands.Event, connector *EmailConnector) {
+	if ce.Portal == nil {
+		ce.Reply("❌ `!matrimail draft` must be run inside an email portal room (the thread you want a draft for), not the management room.")
+		return
+	}
+	if strings.TrimSpace(connector.Config.DraftWebhook.URL) == "" {
+		ce.Reply("❌ Draft webhook is not configured. Ask the bridge admin to set `draft_webhook.url` in `config.yaml`.")
+		return
+	}
+
+	// Find which account this portal belongs to. The portal's Receiver is the
+	// UserLogin ID — same shape as login.ID — so we match against the user's
+	// existing logins to recover the EmailClient.
+	var client *EmailClient
+	for _, login := range ce.User.GetUserLogins() {
+		if login.ID == ce.Portal.Receiver {
+			if c, ok := login.Client.(*EmailClient); ok {
+				client = c
+				break
+			}
+		}
+	}
+	if client == nil {
+		ce.Reply("❌ Couldn't resolve which email account owns this room (portal receiver: `%s`). Are you logged in to that account?", ce.Portal.Receiver)
+		return
+	}
+
+	meta, _ := ce.Portal.Metadata.(*PortalMetadata)
+	req := DraftRequest{
+		Account:  client.Email,
+		UserMXID: ce.User.MXID.String(),
+		Source:   "command",
+		RoomID:   string(ce.Portal.MXID),
+	}
+	if meta != nil {
+		req.ThreadID = meta.ThreadID
+		req.MessageID = meta.LastMessageID
+		req.Subject = meta.Subject
+		req.Participants = meta.Participants
+	}
+	if len(ce.Args) > 0 {
+		req.Instruction = strings.TrimSpace(strings.Join(ce.Args, " "))
+	}
+
+	logger := connector.Bridge.Log.With().Str("component", "draft_webhook").Str("email", client.Email).Logger()
+	ctx, cancel := context.WithTimeout(context.Background(), connector.Config.DraftWebhook.EffectiveTimeout()+5*time.Second)
+	defer cancel()
+
+	resp, err := triggerDraftWebhook(ctx, connector.Config.DraftWebhook, req, &logger)
+	if err != nil {
+		ce.Reply("❌ Draft request failed: %s", err.Error())
+		return
+	}
+
+	msg := "✏️ Draft requested — check Gmail in a moment."
+	if resp != nil && strings.TrimSpace(resp.Message) != "" {
+		msg = fmt.Sprintf("✏️ %s", strings.TrimSpace(resp.Message))
+	}
+	if req.Instruction != "" {
+		msg += fmt.Sprintf("\n\n_Instruction:_ %s", req.Instruction)
+	}
+	ce.Reply(msg)
+}
+
 // backlogMaxDays caps how far back the !matrimail backlog command will scan.
 // Gmail's `newer_than:` query operator accepts arbitrary ranges, but scanning
 // a wide window is expensive (one messages.list pagination per monitored
