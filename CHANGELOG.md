@@ -1,3 +1,10 @@
+## [1.4.1](https://github.com/Leicas/matrimail/compare/v1.4.0...v1.4.1) (2026-05-12)
+
+
+### Bug Fixes
+
+* **gmail:** include labelAdded in history poller types ([95493cf](https://github.com/Leicas/matrimail/commit/95493cf0cbab153b59477cc3c2785f7c35741d9c))
+
 ## [1.4.0](https://github.com/Leicas/matrimail/compare/v1.3.0...v1.4.0) (2026-05-11)
 
 
