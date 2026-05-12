@@ -108,6 +108,31 @@ func (m *GmailInboundManager) Stop(userMXID, emailAddr string) {
 	}
 }
 
+// Backlog asks the poller for (userMXID, emailAddr) to scan the past
+// lookbackDays for messages with monitored labels, feeding each through the
+// usual handleMessage path. Returns the number of messages fed (after dedup).
+// Errors if no poller is registered for the account or lookbackDays <= 0.
+//
+// This is the recovery path for the messageAdded-only history regression: the
+// old poller advanced its cursor past labelAdded events without surfacing
+// them, so any tagged messages from before the fix can't be picked up by the
+// normal history loop. Backlog re-fetches via messages.list, which sees
+// current label state regardless of history cursor.
+func (m *GmailInboundManager) Backlog(ctx context.Context, userMXID, emailAddr string, lookbackDays int) (int, error) {
+	if m == nil {
+		return 0, fmt.Errorf("GmailInboundManager: nil manager")
+	}
+	key := userMXID + "|" + emailAddr
+	m.mu.Lock()
+	r := m.runners[key]
+	m.mu.Unlock()
+	if r == nil {
+		return 0, fmt.Errorf("no Gmail-API poller registered for %s (account may be password-mode, full-scope, or needs-reauth)", emailAddr)
+	}
+	logger := m.connector.Bridge.Log.With().Str("component", "gmail_backlog").Str("email", emailAddr).Logger()
+	return r.poller.Backlog(ctx, lookbackDays, &logger)
+}
+
 // StopAll tears down every registered poller. Called from EmailConnector.Stop.
 func (m *GmailInboundManager) StopAll() {
 	if m == nil {

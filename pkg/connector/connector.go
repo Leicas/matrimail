@@ -348,6 +348,15 @@ func (ec *EmailConnector) createCommands() []commands.CommandHandler {
 				Args:        `paste-code <redirect-url> | paste-token <email> <refresh_token> | revoke <email>`,
 			},
 		},
+		&commands.FullHandler{
+			Func: func(ce *commands.Event) { fnBacklog(ce, ec) },
+			Name: "backlog",
+			Help: commands.HelpMeta{
+				Section:     HelpSectionAdmin,
+				Description: "Scan the past N days for messages with monitored labels and forward any that haven't been bridged (modify-scope Gmail only).",
+				Args:        `[days] [email]`,
+			},
+		},
 	}
 }
 

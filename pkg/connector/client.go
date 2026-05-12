@@ -62,6 +62,13 @@ type EmailClient struct {
 	// IMAP client
 	IMAPClient *imap.Client
 
+	// GmailAPIInbound flags accounts that are served by the Gmail-API inbound
+	// poller (modify-scope OAuth) instead of IMAP. When true, IMAPClient is
+	// intentionally nil and Connect() must not treat that as auth_failure;
+	// the bridge state for the inbox is "established" once the poller is
+	// running (the poller's own ticker handles ongoing health).
+	GmailAPIInbound bool
+
 	// Sender drives outbound email (SMTP or Gmail API). Populated by
 	// LoadUserLogin via email.PickSender; consulted by HandleMatrixMessage.
 	Sender email.Sender
@@ -312,7 +319,11 @@ func (ec *EmailConnector) startGmailInboundIfApplicable(ctx context.Context, ema
 	ts := newReauthAwareTokenSource(base, ec, login,
 		login.UserMXID.String(), emailClient.Email, info.Provider, info.ScopeMode)
 
-	return ec.GmailInbound.Start(ctx, login, emailClient.Email, account.MonitoredFolders, ts)
+	if err := ec.GmailInbound.Start(ctx, login, emailClient.Email, account.MonitoredFolders, ts); err != nil {
+		return err
+	}
+	emailClient.GmailAPIInbound = true
+	return nil
 }
 
 // startClientConnections starts the client connection and registration processes
@@ -522,6 +533,21 @@ func (ec *EmailConnector) loadGmailSignature(ctx context.Context, emailClient *E
 
 func (ec *EmailClient) Connect(ctx context.Context) {
 	if ec.IMAPClient == nil {
+		if ec.GmailAPIInbound {
+			// Modify-scope Gmail OAuth: inbound is served by the Gmail-API
+			// history poller (its own goroutine, started in
+			// startGmailInboundIfApplicable). There's no IMAP socket to keep
+			// open, so report both connection_established and idle_started so
+			// the coordinator's "Connected && IdleRunning => StateConnected"
+			// rule is satisfied (the poller's ticker is the moral equivalent
+			// of IMAP IDLE for this transport). Subsequent transient failures
+			// inside the poller don't currently flow back to the coordinator —
+			// token revocation flips the account to needs-reauth via
+			// reauthAwareTokenSource which fires its own bridge state.
+			ec.stateCoordinator.ReportSimpleEvent("inbox", "connection_established", true, "", nil)
+			ec.stateCoordinator.ReportSimpleEvent("inbox", "idle_started", true, "", nil)
+			return
+		}
 		ec.stateCoordinator.ReportSimpleEvent("inbox", "auth_failure", false, EmailNotLoggedIn, nil)
 		return
 	}

@@ -320,6 +320,90 @@ func (g *GmailHistoryPoller) pollOnce(ctx context.Context, cursor uint64, logger
 	return newCursor, nil
 }
 
+// Backlog scans the past lookback window for messages bearing any of the
+// monitored labels and feeds them through OnMessage, bypassing the history
+// cursor entirely. Useful when the history cursor has advanced past
+// labelAdded events that the old (pre-fix) poller dropped — those messages
+// are otherwise unrecoverable without a manual scan.
+//
+// Returns the number of messages fed to OnMessage (post-dedup). Errors from
+// individual message fetches are logged and counted as skipped, not returned.
+// The caller controls the lookback range; Gmail's `newer_than:` query operator
+// accepts d/m/y units — we use days. A lookback of 0 is rejected (callers
+// should pass an explicit window so an accidental empty value doesn't trigger
+// a full-mailbox scan).
+func (g *GmailHistoryPoller) Backlog(ctx context.Context, lookbackDays int, logger *zerolog.Logger) (int, error) {
+	if lookbackDays <= 0 {
+		return 0, fmt.Errorf("backlog: lookbackDays must be positive, got %d", lookbackDays)
+	}
+	if len(g.MonitoredLabelIDs) == 0 {
+		return 0, fmt.Errorf("backlog: no monitored labels configured")
+	}
+	svc, err := g.gmailService(ctx)
+	if err != nil {
+		return 0, err
+	}
+
+	query := fmt.Sprintf("newer_than:%dd", lookbackDays)
+	// Gmail's messages.list `labelIds` parameter is an AND filter, so we
+	// must scan once per monitored label and dedup client-side.
+	seen := map[string]string{} // messageId → label that surfaced it
+	for _, lblID := range g.MonitoredLabelIDs {
+		pageToken := ""
+		for {
+			list := svc.Users.Messages.List("me").
+				LabelIds(lblID).
+				Q(query).
+				MaxResults(100).
+				Context(ctx)
+			if pageToken != "" {
+				list = list.PageToken(pageToken)
+			}
+			resp, lerr := list.Do()
+			if lerr != nil {
+				return 0, fmt.Errorf("backlog: messages.list label=%s: %w", lblID, lerr)
+			}
+			for _, m := range resp.Messages {
+				if m == nil || m.Id == "" {
+					continue
+				}
+				if _, ok := seen[m.Id]; !ok {
+					seen[m.Id] = lblID
+				}
+			}
+			if resp.NextPageToken == "" {
+				break
+			}
+			pageToken = resp.NextPageToken
+		}
+	}
+
+	if len(seen) == 0 {
+		return 0, nil
+	}
+	logger.Info().Int("candidates", len(seen)).Int("lookback_days", lookbackDays).
+		Strs("labels", g.MonitoredLabelIDs).Msg("Gmail backlog scan starting")
+
+	fed := 0
+	for msgID, mailbox := range seen {
+		full, ferr := svc.Users.Messages.Get("me", msgID).Format("full").Context(ctx).Do()
+		if ferr != nil {
+			logger.Warn().Err(ferr).Str("gmail_msg_id", msgID).Msg("Backlog: failed to fetch message; skipping")
+			continue
+		}
+		if hasLabel(full.LabelIds, "DRAFT") {
+			continue
+		}
+		if cberr := g.OnMessage(ctx, full, mailbox); cberr != nil {
+			logger.Warn().Err(cberr).Str("gmail_msg_id", msgID).Msg("Backlog: OnMessage failed; continuing")
+			continue
+		}
+		fed++
+	}
+	logger.Info().Int("fed", fed).Int("candidates", len(seen)).Msg("Gmail backlog scan complete")
+	return fed, nil
+}
+
 // gmailService constructs a fresh gmail.Service per call. The underlying
 // http client is owned by the service object; constructing each call is
 // trivial vs the round-trip it's about to do.

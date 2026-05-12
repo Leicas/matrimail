@@ -1496,3 +1496,94 @@ The refresh token has been invalidated at Google and the account is paused
 locally. To use this account again, run `+"`!matrimail login`"+`. To delete it
 entirely, run `+"`!matrimail logout %s`"+`.`, emailAddr, emailAddr)
 }
+
+// backlogMaxDays caps how far back the !matrimail backlog command will scan.
+// Gmail's `newer_than:` query operator accepts arbitrary ranges, but scanning
+// a wide window is expensive (one messages.list pagination per monitored
+// label) and risks rate limits.
+const backlogMaxDays = 30
+
+// fnBacklog scans the past N days for messages bearing any of the account's
+// monitored Gmail labels and feeds them through the bridge as if they had
+// just been seen by the history poller. Each message goes through the
+// processor's existing Message-ID dedup, so already-bridged messages are
+// no-ops; the typical use is recovering messages the old (pre-labelAdded)
+// poller missed.
+//
+// Usage:
+//
+//	!matrimail backlog              # 1 day, all modify-mode accounts
+//	!matrimail backlog 7            # 7 days, all modify-mode accounts
+//	!matrimail backlog 3 you@x.com  # 3 days, just one account
+func fnBacklog(ce *commands.Event, connector *EmailConnector) {
+	logins := ce.User.GetUserLogins()
+	if len(logins) == 0 {
+		ce.Reply("ℹ️ You're not connected to any email accounts. Use `!matrimail login` to get started.")
+		return
+	}
+
+	lookbackDays := 1
+	emailFilter := ""
+	if len(ce.Args) >= 1 {
+		var n int
+		if _, perr := fmt.Sscanf(ce.Args[0], "%d", &n); perr != nil || n <= 0 {
+			ce.Reply("❌ First argument must be a positive number of days. Usage: `!matrimail backlog [days] [email]`")
+			return
+		}
+		if n > backlogMaxDays {
+			ce.Reply("❌ Lookback capped at %d days (got %d). Run multiple smaller backlogs if you need more history.", backlogMaxDays, n)
+			return
+		}
+		lookbackDays = n
+	}
+	if len(ce.Args) >= 2 {
+		emailFilter = strings.TrimSpace(ce.Args[1])
+	}
+
+	if connector.GmailInbound == nil {
+		ce.Reply("❌ Gmail inbound manager isn't initialized — backlog only works for modify-scope Gmail OAuth accounts.")
+		return
+	}
+
+	var targets []string
+	for _, login := range logins {
+		client, ok := login.Client.(*EmailClient)
+		if !ok || client == nil {
+			continue
+		}
+		if !client.GmailAPIInbound {
+			continue
+		}
+		if emailFilter != "" && client.Email != emailFilter {
+			continue
+		}
+		targets = append(targets, client.Email)
+	}
+	if len(targets) == 0 {
+		if emailFilter != "" {
+			ce.Reply("❌ No modify-scope Gmail account matching **%s** is connected. (`!matrimail list` to inspect.)", emailFilter)
+		} else {
+			ce.Reply("❌ No modify-scope Gmail accounts connected — backlog only works for Gmail OAuth in modify scope.")
+		}
+		return
+	}
+
+	ce.Reply("🔁 Scanning last **%d day(s)** of monitored labels on %d account(s): %s …", lookbackDays, len(targets), strings.Join(targets, ", "))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	var lines []string
+	totalFed := 0
+	for _, emailAddr := range targets {
+		fed, err := connector.GmailInbound.Backlog(ctx, ce.User.MXID.String(), emailAddr, lookbackDays)
+		if err != nil {
+			lines = append(lines, fmt.Sprintf("• ❌ **%s**: %s", emailAddr, err.Error()))
+			continue
+		}
+		totalFed += fed
+		lines = append(lines, fmt.Sprintf("• ✅ **%s**: queued %d message(s)", emailAddr, fed))
+	}
+
+	ce.Reply("Backlog scan complete — %d message(s) queued total. Existing rooms will get the missing messages; new threads will create rooms as usual.\n\n%s", totalFed, strings.Join(lines, "\n"))
+}
