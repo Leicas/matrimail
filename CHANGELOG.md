@@ -1,3 +1,10 @@
+## [1.6.0](https://github.com/Leicas/matrimail/compare/v1.5.0...v1.6.0) (2026-05-12)
+
+
+### Features
+
+* **commands:** !matrimail draft fires configured webhook ([e7ccf30](https://github.com/Leicas/matrimail/commit/e7ccf3088378c727e73d9092373c2c877953f0af))
+
 ## [1.5.0](https://github.com/Leicas/matrimail/compare/v1.4.1...v1.5.0) (2026-05-12)
 
 
