@@ -1,3 +1,10 @@
+## [1.5.0](https://github.com/Leicas/matrimail/compare/v1.4.1...v1.5.0) (2026-05-12)
+
+
+### Features
+
+* **gmail-api:** backlog command + correct bridge state for modify-mode ([408c8d6](https://github.com/Leicas/matrimail/commit/408c8d69795b9edf3e287165fa2d6839fd5a2dbc))
+
 ## [1.4.1](https://github.com/Leicas/matrimail/compare/v1.4.0...v1.4.1) (2026-05-12)
 
 
