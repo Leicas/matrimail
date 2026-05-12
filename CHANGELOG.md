@@ -1,3 +1,10 @@
+## [1.6.1](https://github.com/Leicas/matrimail/compare/v1.6.0...v1.6.1) (2026-05-12)
+
+
+### Bug Fixes
+
+* **commands:** backfill draft payload from ThreadManager + portal ID ([3c9ebd8](https://github.com/Leicas/matrimail/commit/3c9ebd89059401380492152ab795c993caae8722))
+
 ## [1.6.0](https://github.com/Leicas/matrimail/compare/v1.5.0...v1.6.0) (2026-05-12)
 
 
