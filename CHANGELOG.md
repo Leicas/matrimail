@@ -1,3 +1,10 @@
+## [1.8.0](https://github.com/Leicas/matrimail/compare/v1.7.0...v1.8.0) (2026-05-13)
+
+
+### Features
+
+* **outbound:** reply-all by default, alias-preserving From, DM toggle, thread fallback ([6cb0a89](https://github.com/Leicas/matrimail/commit/6cb0a89c4d40b7f62ec391070bae8173582135fd))
+
 ## [1.7.0](https://github.com/Leicas/matrimail/compare/v1.6.1...v1.7.0) (2026-05-12)
 
 
