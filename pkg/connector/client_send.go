@@ -59,7 +59,7 @@ func (ec *EmailClient) handleMatrixMessageOutbound(ctx context.Context, msg *bri
 		}
 	}
 
-	thread, err := ec.resolveThreadForPortal(msg.Portal.ID)
+	thread, err := ec.resolveThreadForPortalWithMetadata(msg.Portal)
 	if err != nil {
 		return nil, err
 	}
@@ -81,12 +81,39 @@ func (ec *EmailClient) handleMatrixMessageOutbound(ctx context.Context, msg *bri
 		inReplyTo, references = computeReplyChain(thread, msg.ReplyTo)
 	}
 
-	to, err := resolveRecipients(thread.Participants, ec.Email)
+	// Build the alias set (lowercased) once: the user's primary address plus
+	// any send-as aliases. We filter all of these from recipients and pick
+	// the From by matching thread.LastDeliveredTo.
+	selves := make([]string, 0, 1+len(ec.SendAsAliases))
+	selves = append(selves, strings.ToLower(ec.Email))
+	for _, sa := range ec.SendAsAliases {
+		if sa.Email != "" {
+			selves = append(selves, strings.ToLower(sa.Email))
+		}
+	}
+
+	// DM-mode toggle: when the user ran !matrimail reply-only in this room,
+	// the next send goes to thread.LastFrom only.
+	dmMode := false
+	if ec.Main != nil {
+		dmMode = ec.Main.consumePortalNextReplyDM(msg.Portal.ID)
+	}
+
+	var to []netmail.Address
+	var cc []netmail.Address
+	if dmMode {
+		to, err = resolveDMRecipients(thread, selves)
+	} else {
+		to, cc, err = resolveReplyAllRecipients(thread, selves)
+	}
 	if err != nil {
 		return nil, err
 	}
 
-	om := buildOutgoingMessage(ec.Email, thread, msg, inReplyTo, references, to)
+	// Pick From: the alias the most recent inbound was addressed to wins
+	// (when it's known and is one of our addresses); otherwise the primary.
+	fromAddr, fromName := pickFromAddressFromSlice(ec, thread, selves)
+	om := buildOutgoingMessage(fromAddr, fromName, thread, msg, inReplyTo, references, to, cc)
 	// Append the user's Gmail-side signature on NEW threads only, matching
 	// the Gmail web UI's "include signature on first message in thread"
 	// behavior. Signature is empty when the account isn't OAuth-Gmail or
@@ -112,6 +139,7 @@ func (ec *EmailClient) handleMatrixMessageOutbound(ctx context.Context, msg *bri
 	if msg.Content.URL != "" || msg.Content.File != nil {
 		att, attErr := ec.downloadMediaAsAttachment(ctx, msg.Content)
 		if attErr != nil {
+			_ = postErrorToPortal(ctx, ec.UserLogin.Bridge, msg.Portal, "Send failed", "Failed to download attachment: "+attErr.Error())
 			return nil, fmt.Errorf("download attachment: %w", attErr)
 		}
 		om.Attachments = append(om.Attachments, att)
@@ -119,16 +147,21 @@ func (ec *EmailClient) handleMatrixMessageOutbound(ctx context.Context, msg *bri
 
 	mimeBytes, err := om.BuildMIME()
 	if err != nil {
+		_ = postErrorToPortal(ctx, ec.UserLogin.Bridge, msg.Portal, "Send failed", "Failed to build MIME message: "+err.Error())
 		return nil, fmt.Errorf("build mime: %w", err)
 	}
 
-	recipientStrs := make([]string, len(to))
-	for i, a := range to {
-		recipientStrs[i] = a.Address
+	recipientStrs := make([]string, 0, len(to)+len(cc))
+	for _, a := range to {
+		recipientStrs = append(recipientStrs, a.Address)
+	}
+	for _, a := range cc {
+		recipientStrs = append(recipientStrs, a.Address)
 	}
 
-	serverID, err := ec.Sender.Send(ctx, mimeBytes, ec.Email, recipientStrs)
+	serverID, err := ec.Sender.Send(ctx, mimeBytes, fromAddr, recipientStrs)
 	if err != nil {
+		_ = postErrorToPortal(ctx, ec.UserLogin.Bridge, msg.Portal, "Send failed", err.Error())
 		return nil, fmt.Errorf("send: %w", err)
 	}
 
@@ -178,12 +211,17 @@ func (ec *EmailClient) handleMatrixMessageOutbound(ctx context.Context, msg *bri
 	// References chain. Best-effort; failure is logged but not fatal — the
 	// in-memory cache is still good for at least 24h.
 	pm := &PortalMetadata{
-		ThreadID:      thread.ThreadID,
-		Subject:       thread.Subject,
-		Participants:  append([]string(nil), thread.Participants...),
-		References:    append([]string(nil), thread.References...),
-		LastMessageID: thread.MessageID,
-		IsDraft:       thread.IsDraft,
+		ThreadID:        thread.ThreadID,
+		Subject:         thread.Subject,
+		Participants:    append([]string(nil), thread.Participants...),
+		References:      append([]string(nil), thread.References...),
+		LastMessageID:   thread.MessageID,
+		IsDraft:         thread.IsDraft,
+		GmailThreadID:   thread.GmailThreadID,
+		LastFrom:        thread.LastFrom,
+		LastTo:          append([]string(nil), thread.LastTo...),
+		LastCc:          append([]string(nil), thread.LastCc...),
+		LastDeliveredTo: thread.LastDeliveredTo,
 	}
 	msg.Portal.Metadata = pm
 	if err := msg.Portal.Save(ctx); err != nil {
@@ -228,8 +266,8 @@ func deriveSubjectFromBody(body string) string {
 // resolveThreadForPortal looks up the EmailThread that backs this Matrix
 // portal. Stripped portal IDs are of the form "thread:<message-id>". If the
 // thread isn't in the in-memory cache (bridge restart, never received in this
-// room, etc.) we surface a clear error rather than silently dropping the
-// message — Phase D will replenish for compose-only portals via metadata.
+// room, etc.), fall back to reconstructing from Portal.Metadata so cold-cache
+// rooms remain usable for outbound replies.
 func (ec *EmailClient) resolveThreadForPortal(portalID networkid.PortalID) (*email.EmailThread, error) {
 	threadID := strings.TrimPrefix(string(portalID), "thread:")
 	if threadID == "" {
@@ -239,9 +277,42 @@ func (ec *EmailClient) resolveThreadForPortal(portalID networkid.PortalID) (*ema
 		return nil, errors.New("matrimail: ThreadManager not initialized")
 	}
 	thread := ec.Main.ThreadManager.GetThreadByID(string(ec.UserLogin.ID), threadID)
-	if thread == nil {
-		return nil, fmt.Errorf("matrimail: thread %s not found in cache (re-receive a message in this room to re-cache, or this is a stale room)", threadID)
+	if thread != nil {
+		return thread, nil
 	}
+	return nil, fmt.Errorf("matrimail: thread %s not found in cache (re-receive a message in this room to re-cache, or this is a stale room)", threadID)
+}
+
+// resolveThreadForPortalWithMetadata is resolveThreadForPortal extended to
+// rehydrate the thread from Portal.Metadata when the ThreadManager misses.
+// Reseeds the cache so subsequent operations on the same room avoid the
+// round trip.
+func (ec *EmailClient) resolveThreadForPortalWithMetadata(portal *bridgev2.Portal) (*email.EmailThread, error) {
+	if portal == nil {
+		return nil, errors.New("matrimail: nil portal")
+	}
+	if thread, err := ec.resolveThreadForPortal(portal.ID); err == nil {
+		return thread, nil
+	}
+	threadID := strings.TrimPrefix(string(portal.ID), "thread:")
+	pm, ok := portal.Metadata.(*PortalMetadata)
+	if !ok || pm == nil || pm.ThreadID == "" || pm.ThreadID != threadID {
+		return nil, fmt.Errorf("matrimail: thread %s not found in cache and no portal metadata to restore from", threadID)
+	}
+	thread := &email.EmailThread{
+		ThreadID:        pm.ThreadID,
+		Subject:         pm.Subject,
+		Participants:    append([]string(nil), pm.Participants...),
+		References:      append([]string(nil), pm.References...),
+		MessageID:       pm.LastMessageID,
+		IsDraft:         pm.IsDraft,
+		GmailThreadID:   pm.GmailThreadID,
+		LastFrom:        pm.LastFrom,
+		LastTo:          append([]string(nil), pm.LastTo...),
+		LastCc:          append([]string(nil), pm.LastCc...),
+		LastDeliveredTo: pm.LastDeliveredTo,
+	}
+	ec.Main.ThreadManager.CacheForReceiver(string(ec.UserLogin.ID), thread)
 	return thread, nil
 }
 
@@ -262,36 +333,142 @@ func computeReplyChain(thread *email.EmailThread, replyTo *database.Message) (st
 	return "", references
 }
 
-// resolveRecipients filters the thread participant list, dropping the
-// authenticated user (case-insensitive). Returns an error when the resulting
-// list is empty — there's no point sending mail to nobody.
+// resolveReplyAllRecipients computes (To, Cc) for a reply-all outbound:
+//   - To = unique(thread.LastFrom + thread.LastTo) minus selves
+//   - Cc = unique(thread.LastCc) minus selves and minus addresses already in To
 //
-// This is reply-all behavior; Phase D's !matrimail compose handler will let
-// the user narrow the To/Cc set.
-func resolveRecipients(participants []string, self string) ([]netmail.Address, error) {
-	selfLower := strings.ToLower(self)
+// When thread.LastFrom is empty (first send on a compose thread, or restored
+// thread with no inbound), fall back to the old behavior: use
+// thread.Participants minus selves as To, no Cc.
+//
+// selves must be a slice of lowercased addresses (primary + aliases).
+func resolveReplyAllRecipients(thread *email.EmailThread, selves []string) ([]netmail.Address, []netmail.Address, error) {
+	if thread == nil {
+		return nil, nil, errors.New("matrimail: nil thread")
+	}
+	selfSet := selvesSet(selves)
+
+	// Compose-thread / restored-thread fallback path.
+	if strings.TrimSpace(thread.LastFrom) == "" {
+		var to []netmail.Address
+		seen := map[string]bool{}
+		for _, p := range thread.Participants {
+			if a, ok := parseAddrIfAllowed(p, selfSet, seen); ok {
+				to = append(to, a)
+			}
+		}
+		if len(to) == 0 {
+			return nil, nil, errors.New("matrimail: no recipients (thread participants empty after self-exclusion)")
+		}
+		return to, nil, nil
+	}
+
 	var to []netmail.Address
-	for _, p := range participants {
-		if strings.ToLower(p) == selfLower {
-			continue
-		}
-		if a, err := netmail.ParseAddress(p); err == nil {
-			to = append(to, *a)
+	seen := map[string]bool{}
+	if a, ok := parseAddrIfAllowed(thread.LastFrom, selfSet, seen); ok {
+		to = append(to, a)
+	}
+	for _, p := range thread.LastTo {
+		if a, ok := parseAddrIfAllowed(p, selfSet, seen); ok {
+			to = append(to, a)
 		}
 	}
-	if len(to) == 0 {
-		return nil, errors.New("matrimail: no recipients (thread participants empty after self-exclusion)")
+	var cc []netmail.Address
+	for _, p := range thread.LastCc {
+		if a, ok := parseAddrIfAllowed(p, selfSet, seen); ok {
+			cc = append(cc, a)
+		}
 	}
-	return to, nil
+	if len(to) == 0 && len(cc) == 0 {
+		return nil, nil, errors.New("matrimail: no recipients (reply-all set empty after self-exclusion)")
+	}
+	return to, cc, nil
+}
+
+// resolveDMRecipients computes the recipient set for a DM-mode reply: only
+// thread.LastFrom (the sender of the most recent inbound). Returns an error
+// when LastFrom is empty (no inbound to reply to).
+func resolveDMRecipients(thread *email.EmailThread, selves []string) ([]netmail.Address, error) {
+	if thread == nil {
+		return nil, errors.New("matrimail: nil thread")
+	}
+	if strings.TrimSpace(thread.LastFrom) == "" {
+		return nil, errors.New("matrimail: DM mode requested but thread has no LastFrom (no inbound to reply to)")
+	}
+	selfSet := selvesSet(selves)
+	seen := map[string]bool{}
+	if a, ok := parseAddrIfAllowed(thread.LastFrom, selfSet, seen); ok {
+		return []netmail.Address{a}, nil
+	}
+	return nil, errors.New("matrimail: DM mode target was either unparseable or one of the user's own addresses")
+}
+
+// selvesSet converts a slice of lowercased addresses into a lookup set.
+func selvesSet(selves []string) map[string]bool {
+	out := make(map[string]bool, len(selves))
+	for _, s := range selves {
+		if s = strings.ToLower(strings.TrimSpace(s)); s != "" {
+			out[s] = true
+		}
+	}
+	return out
+}
+
+// parseAddrIfAllowed parses a "Name <addr>" / "addr" string, filters self
+// addresses, and dedupes against `seen` (lowercased addr-key). Returns
+// (Address, true) when the entry should be included.
+func parseAddrIfAllowed(raw string, selves, seen map[string]bool) (netmail.Address, bool) {
+	a, err := netmail.ParseAddress(raw)
+	if err != nil {
+		return netmail.Address{}, false
+	}
+	key := strings.ToLower(a.Address)
+	if selves[key] {
+		return netmail.Address{}, false
+	}
+	if seen[key] {
+		return netmail.Address{}, false
+	}
+	seen[key] = true
+	return *a, true
+}
+
+// pickFromAddress returns (address, displayName) for the outbound From
+// header. Prefers thread.LastDeliveredTo when it matches one of the user's
+// aliases; otherwise falls back to the primary address. Display name is
+// pulled from the matching SendAsAliases entry when available.
+func pickFromAddress(ec *EmailClient, thread *email.EmailThread, selves map[string]bool) (string, string) {
+	primary := ec.Email
+	if thread == nil || strings.TrimSpace(thread.LastDeliveredTo) == "" {
+		return primary, ""
+	}
+	want := strings.ToLower(strings.TrimSpace(thread.LastDeliveredTo))
+	if !selves[want] {
+		return primary, ""
+	}
+	for _, sa := range ec.SendAsAliases {
+		if strings.EqualFold(sa.Email, want) {
+			return sa.Email, sa.Name
+		}
+	}
+	// Alias matched the primary or wasn't in the SendAsAliases list; still
+	// honor the address but with no display name override.
+	return thread.LastDeliveredTo, ""
+}
+
+// pickFromAddress overloads via slice-of-strings selves to match the call
+// site that builds a slice rather than a map.
+func pickFromAddressFromSlice(ec *EmailClient, thread *email.EmailThread, selves []string) (string, string) {
+	return pickFromAddress(ec, thread, selvesSet(selves))
 }
 
 // buildOutgoingMessage assembles the OutgoingMessage from the Matrix event
 // content and resolved threading metadata. Re: prefixing matches RFC 5322
 // convention (case-insensitive check so we don't double-prefix).
-func buildOutgoingMessage(selfEmail string, thread *email.EmailThread, msg *bridgev2.MatrixMessage, inReplyTo string, references []string, to []netmail.Address) *email.OutgoingMessage {
+func buildOutgoingMessage(fromAddr, fromName string, thread *email.EmailThread, msg *bridgev2.MatrixMessage, inReplyTo string, references []string, to, cc []netmail.Address) *email.OutgoingMessage {
 	domain := ""
-	if at := strings.LastIndex(selfEmail, "@"); at >= 0 {
-		domain = selfEmail[at+1:]
+	if at := strings.LastIndex(fromAddr, "@"); at >= 0 {
+		domain = fromAddr[at+1:]
 	}
 	newMsgID := strings.Trim(email.GenerateMessageID(domain), "<>")
 
@@ -308,8 +485,9 @@ func buildOutgoingMessage(selfEmail string, thread *email.EmailThread, msg *brid
 
 	return &email.OutgoingMessage{
 		MessageID:  newMsgID,
-		From:       netmail.Address{Address: selfEmail},
+		From:       netmail.Address{Name: fromName, Address: fromAddr},
 		To:         to,
+		Cc:         cc,
 		Subject:    subject,
 		Date:       time.Now(),
 		InReplyTo:  inReplyTo,

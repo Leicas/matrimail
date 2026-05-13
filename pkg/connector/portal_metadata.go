@@ -47,4 +47,19 @@ type PortalMetadata struct {
 	// IsDraft marks a synthetic compose thread that has not yet produced an
 	// outbound email. Cleared on first successful send.
 	IsDraft bool `json:"is_draft,omitempty"`
+
+	// GmailThreadID is the Gmail API's server-assigned thread ID. Persisted
+	// so that restart-time thread reconstruction can re-prime the
+	// gmailThreadIDIndex fallback lookup key.
+	GmailThreadID string `json:"gmail_thread_id,omitempty"`
+
+	// LastFrom is the sender of the most recent inbound (DM-mode target).
+	LastFrom string `json:"last_from,omitempty"`
+	// LastTo / LastCc are the To/Cc of the most recent inbound; used to
+	// split reply-all To/Cc on the next outbound.
+	LastTo []string `json:"last_to,omitempty"`
+	LastCc []string `json:"last_cc,omitempty"`
+	// LastDeliveredTo is the alias the most recent inbound was addressed to;
+	// replies use this as From.
+	LastDeliveredTo string `json:"last_delivered_to,omitempty"`
 }

@@ -55,6 +55,36 @@ type EmailConnector struct {
 	// success/error paths and by Cancel().
 	oauthListenersMu sync.Mutex
 	oauthListeners   map[string]*OAuthListener
+
+	// pendingDMReplies tracks portals whose next outbound should be sent in
+	// DM mode (reply-only-to-sender) instead of reply-all. Set by
+	// MarkPortalNextReplyDM via the !matrimail reply-only command, consumed
+	// once by handleMatrixMessageOutbound.
+	pendingDMRepliesMu sync.Mutex
+	pendingDMReplies   map[networkid.PortalID]struct{}
+}
+
+// MarkPortalNextReplyDM flags the next outbound in the given portal as a
+// DM-mode reply.
+func (ec *EmailConnector) MarkPortalNextReplyDM(portalID networkid.PortalID) {
+	ec.pendingDMRepliesMu.Lock()
+	defer ec.pendingDMRepliesMu.Unlock()
+	if ec.pendingDMReplies == nil {
+		ec.pendingDMReplies = map[networkid.PortalID]struct{}{}
+	}
+	ec.pendingDMReplies[portalID] = struct{}{}
+}
+
+// consumePortalNextReplyDM atomically tests-and-clears the DM toggle for a
+// portal. Returns true exactly once after each MarkPortalNextReplyDM.
+func (ec *EmailConnector) consumePortalNextReplyDM(portalID networkid.PortalID) bool {
+	ec.pendingDMRepliesMu.Lock()
+	defer ec.pendingDMRepliesMu.Unlock()
+	if _, ok := ec.pendingDMReplies[portalID]; ok {
+		delete(ec.pendingDMReplies, portalID)
+		return true
+	}
+	return false
 }
 
 var (
@@ -206,6 +236,32 @@ func (ec *EmailConnector) Init(bridge *bridgev2.Bridge) {
 		panic(fmt.Errorf("sent dedup table init failed: %w", err))
 	}
 	ec.Processor.SetDedupChecker(&dedupAdapter{store: ec.SentDedup})
+
+	// Alias resolver: when an inbound email lands, pickDeliveredTo needs the
+	// list of addresses that count as "this user" (primary + send-as
+	// aliases) so it can detect that mail addressed to e.g.
+	// alice@example.com was delivered to the Gmail account billing@biz.com.
+	ec.Processor.SetAliasResolver(func(receiver string) []string {
+		login := ec.Bridge.GetCachedUserLoginByID(networkid.UserLoginID(receiver))
+		if login == nil {
+			return nil
+		}
+		client, _ := login.Client.(*EmailClient)
+		if client == nil {
+			return nil
+		}
+		out := []string{strings.ToLower(client.Email)}
+		for _, sa := range client.SendAsAliases {
+			if sa.Email != "" {
+				out = append(out, strings.ToLower(sa.Email))
+			}
+		}
+		return out
+	})
+
+	// Error notifier: surface user-visible processing errors into the
+	// affected Matrix room (best-effort).
+	ec.Processor.SetErrorNotifier(&processorErrorNotifier{ec: ec})
 
 	// Gmail-API inbound pollers — one per modify-mode account, spawned in
 	// LoadUserLogin. The manager itself is just bookkeeping.
@@ -367,6 +423,24 @@ func (ec *EmailConnector) createCommands() []commands.CommandHandler {
 			},
 			RequiresPortal: true,
 		},
+		&commands.FullHandler{
+			Func: func(ce *commands.Event) { fnReplyOnly(ce, ec) },
+			Name: "reply-only",
+			Help: commands.HelpMeta{
+				Section:     HelpSectionInfo,
+				Description: "Make your next message in this room reply ONLY to the original sender (DM mode), not reply-all.",
+			},
+			RequiresPortal: true,
+		},
+		&commands.FullHandler{
+			Func: func(ce *commands.Event) { fnReplyOnly(ce, ec) },
+			Name: "dm",
+			Help: commands.HelpMeta{
+				Section:     HelpSectionInfo,
+				Description: "Alias of !matrimail reply-only.",
+			},
+			RequiresPortal: true,
+		},
 	}
 }
 
@@ -491,12 +565,17 @@ func (ec *EmailConnector) GetChatInfo(ctx context.Context, portal *bridgev2.Port
 		if thread == nil && portal != nil {
 			if pm, ok := portal.Metadata.(*PortalMetadata); ok && pm != nil && pm.ThreadID == threadID {
 				thread = &email.EmailThread{
-					ThreadID:     pm.ThreadID,
-					Subject:      pm.Subject,
-					Participants: append([]string(nil), pm.Participants...),
-					References:   append([]string(nil), pm.References...),
-					MessageID:    pm.LastMessageID,
-					IsDraft:      pm.IsDraft,
+					ThreadID:        pm.ThreadID,
+					Subject:         pm.Subject,
+					Participants:    append([]string(nil), pm.Participants...),
+					References:      append([]string(nil), pm.References...),
+					MessageID:       pm.LastMessageID,
+					IsDraft:         pm.IsDraft,
+					GmailThreadID:   pm.GmailThreadID,
+					LastFrom:        pm.LastFrom,
+					LastTo:          append([]string(nil), pm.LastTo...),
+					LastCc:          append([]string(nil), pm.LastCc...),
+					LastDeliveredTo: pm.LastDeliveredTo,
 				}
 				ec.ThreadManager.CacheForReceiver(string(userLogin.ID), thread)
 				ec.Bridge.Log.Debug().

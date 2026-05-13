@@ -74,6 +74,45 @@ func TestAddToExistingThread_NormalInbound(t *testing.T) {
 	}
 }
 
+// Locks in the Gmail threadId fallback: an inbound whose RFC 5322 headers
+// (Message-ID, In-Reply-To, References) miss the existing thread cache but
+// whose GmailThreadID matches a previously-cached thread MUST attach to that
+// thread rather than creating a new one.
+func TestDetermineThread_GmailThreadIDFallback(t *testing.T) {
+	t.Parallel()
+	tm := NewThreadManager(nil)
+
+	// Seed an existing thread with a known Gmail thread id.
+	existing := &EmailThread{
+		ThreadID:      "m1",
+		Subject:       "Project status",
+		Participants:  []string{"alice@example.com", "antoine@haply.co"},
+		MessageID:     "m1",
+		References:    []string{"m1"},
+		GmailThreadID: "g1",
+	}
+	tm.CacheForReceiver("email:antoine@haply.co", existing)
+
+	// Brand-new message: fresh Message-ID, empty threading headers — only the
+	// GmailThreadID ties it back to the previous conversation.
+	fresh := &ParsedEmail{
+		MessageID:     "m2-fresh@gmail.com",
+		Subject:       "Re: Project status",
+		From:          "alice@example.com",
+		To:            []string{"antoine@haply.co"},
+		InReplyTo:     "",
+		References:    nil,
+		GmailThreadID: "g1",
+	}
+	got := tm.DetermineThread("email:antoine@haply.co", fresh)
+	if got == nil {
+		t.Fatalf("DetermineThread returned nil; expected existing thread")
+	}
+	if got.ThreadID != "m1" {
+		t.Errorf("expected ThreadID=m1 (existing thread via GmailThreadID fallback); got %q", got.ThreadID)
+	}
+}
+
 func equalSorted(a, b []string) bool {
 	if len(a) != len(b) {
 		return false

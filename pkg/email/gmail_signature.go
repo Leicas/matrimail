@@ -44,6 +44,43 @@ func FetchGmailSignature(ctx context.Context, svc *gmail.Service, sendAsEmail st
 	return "", nil
 }
 
+// GmailSendAs describes one send-as identity (primary or alias) returned by
+// users.settings.sendAs.list. The bridge uses the alias list to (a) detect
+// inbound DeliveredTo (which alias an incoming mail was addressed to) and
+// (b) preserve that alias as the From on outbound replies.
+type GmailSendAs struct {
+	Email     string
+	Name      string // display name from the send-as settings
+	IsPrimary bool
+	Signature string
+}
+
+// FetchGmailSendAsList returns all send-as identities (primary and aliases)
+// for the authenticated user. Best-effort at the call site — empty slice on
+// any error so a misconfigured / unauthorized account doesn't break inbound.
+func FetchGmailSendAsList(ctx context.Context, svc *gmail.Service) ([]GmailSendAs, error) {
+	if svc == nil {
+		return nil, fmt.Errorf("FetchGmailSendAsList: nil gmail service")
+	}
+	resp, err := svc.Users.Settings.SendAs.List("me").Context(ctx).Do()
+	if err != nil {
+		return nil, fmt.Errorf("list send-as: %w", err)
+	}
+	out := make([]GmailSendAs, 0, len(resp.SendAs))
+	for _, sa := range resp.SendAs {
+		if sa == nil || sa.SendAsEmail == "" {
+			continue
+		}
+		out = append(out, GmailSendAs{
+			Email:     sa.SendAsEmail,
+			Name:      sa.DisplayName,
+			IsPrimary: sa.IsPrimary,
+			Signature: sa.Signature,
+		})
+	}
+	return out, nil
+}
+
 // htmlTagRe matches HTML tags so we can strip them when deriving a plain-text
 // fallback for the signature. Not a real HTML parser — Gmail signatures are
 // usually simple (links, line breaks, the occasional image), and this gets

@@ -48,6 +48,25 @@ type EmailThread struct {
 	AddedParticipants   []string // Participants added in the latest email
 	RemovedParticipants []string // Participants removed in the latest email
 
+	// GmailThreadID is Gmail API's server-assigned thread ID, used as a
+	// fallback lookup key when RFC 5322 headers miss (cache eviction past
+	// 24h, references not previously bridged, etc.). Sticky once known.
+	GmailThreadID string
+
+	// LastDeliveredTo is the user's alias the most recent inbound was
+	// addressed to. Replies use this as From so a message that arrived at
+	// an alias gets a reply From the alias, not the primary address.
+	LastDeliveredTo string
+
+	// LastFrom is the sender of the most recent inbound. Used for DM-mode
+	// (reply-only-to-sender) replies.
+	LastFrom string
+	// LastTo is the To header of the most recent inbound. Used to split
+	// reply-all To/Cc.
+	LastTo []string
+	// LastCc is the Cc header of the most recent inbound.
+	LastCc []string
+
 	// Cache management
 	LastAccessed time.Time // For TTL cleanup
 }
@@ -77,19 +96,36 @@ type ThreadManager struct {
 	knownThreads map[string]*EmailThread // key: receiver|threadID
 	// Performance optimization: message ID -> thread lookup index
 	messageIDIndex map[string]*EmailThread // key: messageID, value: thread containing that message
-	mu             sync.RWMutex
-	resolver       ThreadMetadataResolver // optional external resolver
-	lastCleanup    time.Time               // Last time we ran cache cleanup
+	// Gmail-API thread-id index: receiver + "|" + gmailThreadID -> thread.
+	// Used as a fallback when RFC 5322 lookup misses.
+	gmailThreadIDIndex map[string]*EmailThread
+	mu                 sync.RWMutex
+	resolver           ThreadMetadataResolver // optional external resolver
+	lastCleanup        time.Time              // Last time we ran cache cleanup
 }
 
 // NewThreadManager creates a new email thread manager
 func NewThreadManager(resolver ThreadMetadataResolver) *ThreadManager {
 	return &ThreadManager{
-		knownThreads:   make(map[string]*EmailThread),
-		messageIDIndex: make(map[string]*EmailThread),
-		resolver:       resolver,
-		lastCleanup:    time.Now(),
+		knownThreads:       make(map[string]*EmailThread),
+		messageIDIndex:     make(map[string]*EmailThread),
+		gmailThreadIDIndex: make(map[string]*EmailThread),
+		resolver:           resolver,
+		lastCleanup:        time.Now(),
 	}
+}
+
+// findByGmailThreadID returns the thread cached under (receiver, gtid), or nil.
+func (tm *ThreadManager) findByGmailThreadID(receiver, gtid string) *EmailThread {
+	if gtid == "" {
+		return nil
+	}
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+	if t, ok := tm.gmailThreadIDIndex[receiver+"|"+gtid]; ok {
+		return t
+	}
+	return nil
 }
 
 // GetThreadByID returns a thread by its ThreadID if known
@@ -124,13 +160,13 @@ func (tm *ThreadManager) cacheThread(receiver string, thread *EmailThread) {
 	key := receiver + "|" + thread.ThreadID
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
-	
+
 	thread.LastAccessed = time.Now()
 	tm.knownThreads[key] = thread
-	
+
 	// Update message ID index for fast lookups
-	tm.updateMessageIDIndex(thread)
-	
+	tm.updateMessageIDIndex(receiver, thread)
+
 	// Enforce cache size limit
 	if len(tm.knownThreads) > maxCachedThreads {
 		tm.evictOldestThreads(maxCachedThreads / 4) // Remove 25% when limit exceeded
@@ -138,7 +174,7 @@ func (tm *ThreadManager) cacheThread(receiver string, thread *EmailThread) {
 }
 
 // updateMessageIDIndex maintains the message ID -> thread index
-func (tm *ThreadManager) updateMessageIDIndex(thread *EmailThread) {
+func (tm *ThreadManager) updateMessageIDIndex(receiver string, thread *EmailThread) {
 	// Index the thread ID itself
 	if thread.ThreadID != "" {
 		tm.messageIDIndex[thread.ThreadID] = thread
@@ -152,6 +188,10 @@ func (tm *ThreadManager) updateMessageIDIndex(thread *EmailThread) {
 	// Index the current message ID if different from thread ID
 	if thread.MessageID != "" && thread.MessageID != thread.ThreadID {
 		tm.messageIDIndex[thread.MessageID] = thread
+	}
+	// Index by Gmail thread ID (per-receiver scoped) when known.
+	if thread.GmailThreadID != "" {
+		tm.gmailThreadIDIndex[receiver+"|"+thread.GmailThreadID] = thread
 	}
 }
 
@@ -180,6 +220,14 @@ type ParsedEmail struct {
 	// Matrix room — drafts have unstable Message-IDs and self-From, which
 	// otherwise makes them appear in Matrix as "a reply by someone".
 	IsDraft bool
+	// GmailThreadID is the Gmail API's server-assigned thread ID. Only set
+	// on the Gmail-API ingest path (modify-scope). Used as a fallback lookup
+	// key when RFC 5322 header threading misses.
+	GmailThreadID string
+	// DeliveredTo is the user's own address that this inbound was addressed
+	// to (matched against the user's send-as aliases). Empty if no match.
+	// Used so replies preserve the alias as the From header.
+	DeliveredTo string
 }
 
 
@@ -257,6 +305,16 @@ func (tm *ThreadManager) DetermineThread(receiver string, email *ParsedEmail) *E
 			if thread := tm.findThreadByMessageID(refID); thread != nil {
 				return tm.addToExistingThread(thread, email)
 			}
+		}
+	}
+
+	// Step 2.5: Gmail thread ID fallback. RFC 5322 lookup misses when the parent
+	// wasn't previously bridged (cache evicted, fresh install, participants who
+	// weren't in the original chain replying-all). Gmail's server-assigned
+	// ThreadId remains stable across the whole conversation.
+	if email.GmailThreadID != "" {
+		if thread := tm.findByGmailThreadID(receiver, email.GmailThreadID); thread != nil {
+			return tm.addToExistingThread(thread, email)
 		}
 	}
 
@@ -365,6 +423,26 @@ func (tm *ThreadManager) addToExistingThread(thread *EmailThread, email *ParsedE
 		// Note: Index update will be handled by CacheForReceiver path under write lock
 	}
 
+	// Sticky upgrade: once we learn a Gmail thread ID for this conversation,
+	// keep it. The IMAP path doesn't set it; the Gmail-API path does.
+	if email.GmailThreadID != "" {
+		thread.GmailThreadID = email.GmailThreadID
+	}
+	// Sticky reply-context fields: most recent inbound dictates From/To/Cc
+	// for the next outbound reply.
+	if email.DeliveredTo != "" {
+		thread.LastDeliveredTo = email.DeliveredTo
+	}
+	if email.From != "" {
+		thread.LastFrom = email.From
+	}
+	if email.To != nil {
+		thread.LastTo = append([]string(nil), email.To...)
+	}
+	if email.Cc != nil {
+		thread.LastCc = append([]string(nil), email.Cc...)
+	}
+
 	return thread
 }
 
@@ -400,13 +478,18 @@ func (tm *ThreadManager) createNewThread(email *ParsedEmail) *EmailThread {
 
 	// Create new thread
 	thread := &EmailThread{
-		ThreadID:     threadID,
-		Subject:      email.Subject,
-		Participants: participants,
-		MessageID:    email.MessageID,
-		InReplyTo:    email.InReplyTo,
-		References:   email.References,
-		LastAccessed: time.Now(),
+		ThreadID:        threadID,
+		Subject:         email.Subject,
+		Participants:    participants,
+		MessageID:       email.MessageID,
+		InReplyTo:       email.InReplyTo,
+		References:      email.References,
+		GmailThreadID:   email.GmailThreadID,
+		LastDeliveredTo: email.DeliveredTo,
+		LastFrom:        email.From,
+		LastTo:          append([]string(nil), email.To...),
+		LastCc:          append([]string(nil), email.Cc...),
+		LastAccessed:    time.Now(),
 	}
 
 	// Add to known threads (no receiver here; caller will cache after DetermineThread using receiver)
@@ -619,6 +702,13 @@ func (tm *ThreadManager) removeFromMessageIDIndex(thread *EmailThread) {
 	for _, ref := range thread.References {
 		if ref != "" {
 			delete(tm.messageIDIndex, ref)
+		}
+	}
+	// Also drop any gmailThreadIDIndex entries that point at this thread.
+	// We don't carry the receiver on the thread, so do a value-equality sweep.
+	for k, v := range tm.gmailThreadIDIndex {
+		if v == thread {
+			delete(tm.gmailThreadIDIndex, k)
 		}
 	}
 }

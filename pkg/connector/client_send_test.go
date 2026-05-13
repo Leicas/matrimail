@@ -57,13 +57,18 @@ func TestIsLoggedIn(t *testing.T) {
 	}
 }
 
-func TestResolveRecipients_SkipsSelfCaseInsensitive(t *testing.T) {
-	to, err := resolveRecipients(
-		[]string{"alice@example.com", "BOB@example.com", "self@example.com"},
-		"Self@Example.com",
-	)
+func TestResolveReplyAll_FallbackToParticipants_SkipsSelfCaseInsensitive(t *testing.T) {
+	// thread.LastFrom is empty (compose-style fallback path); reply-all uses
+	// thread.Participants minus selves.
+	thread := &email.EmailThread{
+		Participants: []string{"alice@example.com", "BOB@example.com", "self@example.com"},
+	}
+	to, cc, err := resolveReplyAllRecipients(thread, []string{"self@example.com"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(cc) != 0 {
+		t.Errorf("expected no Cc on fallback path, got %+v", cc)
 	}
 	if len(to) != 2 {
 		t.Fatalf("expected 2 recipients, got %d (%+v)", len(to), to)
@@ -75,22 +80,73 @@ func TestResolveRecipients_SkipsSelfCaseInsensitive(t *testing.T) {
 	if !got["alice@example.com"] || !got["BOB@example.com"] {
 		t.Errorf("recipient set wrong: %+v", got)
 	}
-	if got["self@example.com"] || got["Self@Example.com"] {
+	if got["self@example.com"] {
 		t.Errorf("self leaked into recipients: %+v", got)
 	}
 }
 
-func TestResolveRecipients_ErrorsWhenEmpty(t *testing.T) {
-	_, err := resolveRecipients([]string{"self@example.com"}, "self@example.com")
+func TestResolveReplyAll_ErrorsWhenEmpty(t *testing.T) {
+	thread := &email.EmailThread{Participants: []string{"self@example.com"}}
+	_, _, err := resolveReplyAllRecipients(thread, []string{"self@example.com"})
 	if err == nil {
 		t.Fatal("expected error when no recipients remain after self-exclusion")
 	}
 }
 
-func TestResolveRecipients_ErrorsOnMalformedOnly(t *testing.T) {
-	_, err := resolveRecipients([]string{"not an email"}, "self@example.com")
+func TestResolveReplyAll_SplitsToAndCc(t *testing.T) {
+	thread := &email.EmailThread{
+		LastFrom: "alice@example.com",
+		LastTo:   []string{"self@example.com", "bob@example.com"},
+		LastCc:   []string{"carol@example.com", "ALIAS@example.com", "alice@example.com"},
+	}
+	// "self" plus "alias" are both treated as the user.
+	to, cc, err := resolveReplyAllRecipients(thread, []string{"self@example.com", "alias@example.com"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	gotTo := map[string]bool{}
+	for _, a := range to {
+		gotTo[a.Address] = true
+	}
+	if !gotTo["alice@example.com"] || !gotTo["bob@example.com"] {
+		t.Errorf("To set wrong: %+v", gotTo)
+	}
+	if gotTo["self@example.com"] || gotTo["ALIAS@example.com"] {
+		t.Errorf("self leaked into To: %+v", gotTo)
+	}
+	gotCc := map[string]bool{}
+	for _, a := range cc {
+		gotCc[a.Address] = true
+	}
+	// alice@example.com is already in To and must be deduped out of Cc.
+	if gotCc["alice@example.com"] {
+		t.Errorf("alice should have been deduped out of Cc (already in To): %+v", gotCc)
+	}
+	if !gotCc["carol@example.com"] {
+		t.Errorf("carol should remain in Cc: %+v", gotCc)
+	}
+}
+
+func TestResolveDM_TargetsLastFromOnly(t *testing.T) {
+	thread := &email.EmailThread{
+		LastFrom: "alice@example.com",
+		LastTo:   []string{"self@example.com", "bob@example.com"},
+		LastCc:   []string{"carol@example.com"},
+	}
+	to, err := resolveDMRecipients(thread, []string{"self@example.com"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(to) != 1 || to[0].Address != "alice@example.com" {
+		t.Errorf("DM mode should target only LastFrom; got %+v", to)
+	}
+}
+
+func TestResolveDM_ErrorsWhenLastFromEmpty(t *testing.T) {
+	thread := &email.EmailThread{}
+	_, err := resolveDMRecipients(thread, []string{"self@example.com"})
 	if err == nil {
-		t.Fatal("expected error when no recipients parse")
+		t.Fatal("expected error when LastFrom is empty")
 	}
 }
 

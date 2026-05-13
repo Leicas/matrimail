@@ -80,6 +80,13 @@ type EmailClient struct {
 	// it, matching Gmail's "include only on first message" toggle).
 	Signature string
 
+	// SendAsAliases is the user's full send-as identity set (primary +
+	// aliases) as reported by Gmail. Populated for OAuth-Gmail accounts at
+	// LoadUserLogin time; empty for password / non-Gmail accounts. Used so
+	// inbound mail addressed to an alias gets a reply From that alias, not
+	// from the primary address.
+	SendAsAliases []email.GmailSendAs
+
 	// Configuration
 	config ClientConfig
 
@@ -527,6 +534,17 @@ func (ec *EmailConnector) loadGmailSignature(ctx context.Context, emailClient *E
 	emailClient.Signature = sig
 	if sig != "" {
 		ec.Bridge.Log.Info().Str("email", emailClient.Email).Int("signature_html_len", len(sig)).Msg("Loaded Gmail signature for outbound new-thread emails")
+	}
+	// Best-effort: load the user's full send-as identity list (primary +
+	// aliases). Failures are non-fatal — the user just won't get
+	// alias-preserving From on replies addressed to an alias.
+	aliases, aerr := email.FetchGmailSendAsList(ctx, svc)
+	if aerr != nil {
+		ec.Bridge.Log.Debug().Err(aerr).Str("email", emailClient.Email).Msg("Failed to load Gmail send-as aliases; replies will always go from the primary address")
+		emailClient.SendAsAliases = nil
+	} else {
+		emailClient.SendAsAliases = aliases
+		ec.Bridge.Log.Info().Str("email", emailClient.Email).Int("count", len(aliases)).Msg("Loaded Gmail send-as identities")
 	}
 	return nil
 }

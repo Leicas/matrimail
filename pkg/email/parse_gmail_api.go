@@ -32,8 +32,9 @@ func ParseGmailAPIMessage(msg *gmail.Message) (*ParsedEmail, error) {
 	parsed := &ParsedEmail{
 		// Fallback Message-ID if no header is present (rare; Gmail synthesises
 		// one on send, but inbound messages from broken senders may lack one).
-		MessageID: fmt.Sprintf("gmail-api-%s", msg.Id),
-		Date:      time.Unix(0, msg.InternalDate*int64(time.Millisecond)),
+		MessageID:     fmt.Sprintf("gmail-api-%s", msg.Id),
+		Date:          time.Unix(0, msg.InternalDate*int64(time.Millisecond)),
+		GmailThreadID: msg.ThreadId,
 	}
 
 	for _, h := range msg.Payload.Headers {

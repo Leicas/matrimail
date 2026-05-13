@@ -62,6 +62,19 @@ type DedupChecker interface {
 	IsOurMessage(ctx context.Context, receiver, messageID string) (bool, error)
 }
 
+// AliasResolver returns the bridge user's known addresses (primary + send-as
+// aliases, all lowercased) for the given userLogin receiver. An empty slice
+// indicates no alias info is available — processor falls back to treating
+// every recipient as "other".
+type AliasResolver func(receiver string) []string
+
+// ErrorNotifier is called when processing surfaces a user-visible problem
+// (body parse failure, attachment failure) that should be reported to the
+// affected room. The connector wires a concrete implementation; nil-tolerant.
+type ErrorNotifier interface {
+	NotifyProcessingError(ctx context.Context, receiver, messageID, subject, kind string, err error)
+}
+
 // Processor handles the complete email processing pipeline
 type Processor struct {
 	log           *zerolog.Logger
@@ -80,11 +93,61 @@ type Processor struct {
 	// dedupChecker is consulted on Sent-mailbox messages to suppress our own
 	// outbound echoes. nil means dedup is disabled (legacy / inbound-only mode).
 	dedupChecker DedupChecker
+
+	// aliasResolver returns the bridge user's primary + alias addresses.
+	// Used to detect DeliveredTo on inbound mail so replies preserve the
+	// alias. nil means aliases are unknown (legacy / non-Gmail).
+	aliasResolver AliasResolver
+
+	// errorNotifier surfaces user-visible processing errors back into the
+	// affected Matrix room. nil-tolerant.
+	errorNotifier ErrorNotifier
 }
 
 // SetDedupChecker wires a DedupChecker into the processor. Called once at
 // startup from EmailConnector.Init.
 func (p *Processor) SetDedupChecker(d DedupChecker) { p.dedupChecker = d }
+
+// SetAliasResolver wires an AliasResolver into the processor. Called once at
+// startup from EmailConnector.Init.
+func (p *Processor) SetAliasResolver(r AliasResolver) { p.aliasResolver = r }
+
+// SetErrorNotifier wires an ErrorNotifier into the processor.
+func (p *Processor) SetErrorNotifier(n ErrorNotifier) { p.errorNotifier = n }
+
+// pickDeliveredTo returns the first address in to/cc that matches one of the
+// user's aliases (case-insensitive), preserving the original casing/formatting
+// from the inbound headers. Empty string when nothing matches.
+func pickDeliveredTo(to, cc, aliases []string) string {
+	if len(aliases) == 0 {
+		return ""
+	}
+	lookup := make(map[string]bool, len(aliases))
+	for _, a := range aliases {
+		if a = strings.ToLower(strings.TrimSpace(a)); a != "" {
+			lookup[a] = true
+		}
+	}
+	check := func(list []string) string {
+		for _, raw := range list {
+			addr := extractEmailAddress(raw)
+			if addr == "" {
+				continue
+			}
+			if lookup[strings.ToLower(addr)] {
+				return addr
+			}
+		}
+		return ""
+	}
+	if hit := check(to); hit != "" {
+		return hit
+	}
+	if hit := check(cc); hit != "" {
+		return hit
+	}
+	return ""
+}
 
 // NewProcessor creates a new email processor
 func NewProcessor(log *zerolog.Logger, threadManager *ThreadManager, sanitized bool, secret string) *Processor {
@@ -193,8 +256,16 @@ func (p *Processor) ProcessParsedEmail(ctx context.Context, parsedEmail *ParsedE
 		}
 	}
 
-	// Step 1: Determine thread membership (scoped by receiver)
+	// Resolve DeliveredTo (which alias this inbound was addressed to) before
+	// threading so the resulting thread sticks the alias for outbound use.
 	receiver := string(userLogin.ID)
+	if p.aliasResolver != nil {
+		if aliases := p.aliasResolver(receiver); len(aliases) > 0 {
+			parsedEmail.DeliveredTo = pickDeliveredTo(parsedEmail.To, parsedEmail.Cc, aliases)
+		}
+	}
+
+	// Step 1: Determine thread membership (scoped by receiver)
 	thread := p.threadManager.DetermineThread(receiver, parsedEmail)
 	p.threadManager.CacheForReceiver(receiver, thread)
 	if thread == nil {
@@ -315,6 +386,9 @@ func (p *Processor) parseIMAPFetchData(fetchData *imapclient.FetchMessageData) (
 	}
 
 // Parse body sections for text and HTML content
+	// TODO: thread receiver/login through parseIMAPFetchData so we can call
+	// p.errorNotifier.NotifyProcessingError on these failures and surface
+	// them into the affected room instead of the management room.
 	textContent, htmlContent, err := p.parseMessageBody(buf)
 	if err != nil {
 		p.log.Warn().Err(err).Msg("Failed to parse message body, using fallback")

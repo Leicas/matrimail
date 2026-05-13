@@ -85,6 +85,16 @@ func (m *GmailInboundManager) Start(ctx context.Context, login *bridgev2.UserLog
 	go func() {
 		if err := poller.Run(runnerCtx); err != nil && runnerCtx.Err() == nil {
 			logger.Error().Err(err).Msg("Gmail history poller exited with error")
+			// Surface to the user via the management room — they won't see
+			// inbound mail until the bridge is restarted or the account is
+			// re-loaded. Best-effort: a delivery failure is non-critical (the
+			// log + bridge state still catch it).
+			if login != nil && login.User != nil {
+				notice := fmt.Sprintf("Gmail inbox polling stopped: %s", err.Error())
+				if nerr := sendBridgeNotice(context.Background(), login.User, notice); nerr != nil {
+					logger.Warn().Err(nerr).Msg("Failed to deliver Gmail poller stop notice")
+				}
+			}
 		}
 	}()
 

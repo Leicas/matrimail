@@ -1502,6 +1502,33 @@ locally. To use this account again, run `+"`!matrimail login`"+`. To delete it
 entirely, run `+"`!matrimail logout %s`"+`.`, emailAddr, emailAddr)
 }
 
+// fnReplyOnly toggles the next outbound in this portal to DM mode (reply
+// only to thread.LastFrom). One-shot: consumed on the next send, then resets.
+func fnReplyOnly(ce *commands.Event, connector *EmailConnector) {
+	if ce.Portal == nil {
+		ce.Reply("❌ `!matrimail reply-only` must be run inside an email portal room.")
+		return
+	}
+	connector.MarkPortalNextReplyDM(ce.Portal.ID)
+	target := ""
+	if connector.ThreadManager != nil {
+		threadID := strings.TrimPrefix(string(ce.Portal.ID), "thread:")
+		// Best-effort: we don't have the receiver here; iterate the user's
+		// logins to find the matching thread.
+		for _, login := range ce.User.GetUserLogins() {
+			if t := connector.ThreadManager.GetThreadByID(string(login.ID), threadID); t != nil {
+				target = t.LastFrom
+				break
+			}
+		}
+	}
+	if target == "" {
+		ce.Reply("✅ Next reply in this room will go to the original sender only (DM mode).")
+	} else {
+		ce.Reply(fmt.Sprintf("✅ Next reply in this room will go to **%s** only (DM mode).", target))
+	}
+}
+
 // fnDraft fires the configured draft webhook (typically an n8n flow) for the
 // thread that owns the room the command was run in. Any extra args after
 // `draft` are joined and forwarded as a free-form Instruction the workflow
