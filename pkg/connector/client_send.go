@@ -481,8 +481,12 @@ func buildOutgoingMessage(fromAddr, fromName string, thread *email.EmailThread, 
 	// Subject: normalize to a single "Re: " prefix on replies (no "Re: Re: …"
 	// chains), and leave a first-send subject untouched. NormalizeReplySubject
 	// strips every leading Re:/RE:/re:/Re[N]: and prepends exactly one "Re: ".
+	// "Reply" here means anything threading into an existing message — either
+	// an explicit Matrix reply (msg.ReplyTo set) or a plain send into a thread
+	// that already has a tail (inReplyTo populated by computeReplyChain).
+	isReply := inReplyTo != ""
 	subject := thread.Subject
-	if msg.ReplyTo != nil {
+	if isReply {
 		subject = email.NormalizeReplySubject(subject)
 	}
 
@@ -496,7 +500,7 @@ func buildOutgoingMessage(fromAddr, fromName string, thread *email.EmailThread, 
 	// append "On <date>, <sender> wrote:" followed by a `>`-quoted parent body
 	// (text), and a <div class="gmail_quote"> block (HTML). The parent body is
 	// captured on the inbound path in EmailThread.LastTextBody / LastHTMLBody.
-	if msg.ReplyTo != nil && (thread.LastTextBody != "" || thread.LastHTMLBody != "") {
+	if isReply && (thread.LastTextBody != "" || thread.LastHTMLBody != "") {
 		quoteText := email.FormatGmailQuoteText(thread.LastDate, thread.LastFrom, thread.LastTextBody)
 		if quoteText != "" {
 			if textBody != "" {

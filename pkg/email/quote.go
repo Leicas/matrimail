@@ -39,17 +39,19 @@ func StripQuotedReply(text string) string {
 		l := strings.TrimRight(lines[i], " \t\r")
 		ll := strings.TrimSpace(l)
 
-		// (1) Gmail / Apple Mail: `On ... wrote:`
-		if gmailAttrRE.MatchString(ll) {
+		// (1) Gmail / Apple Mail attribution: locale-specific "On ... wrote:" lines.
+		if matchesGmailAttribution(ll) {
 			cut = i
 			break
 		}
-		// Multi-line variant: `On <date>` ... `<addr> wrote:` split across 2-3 lines.
-		if strings.HasPrefix(ll, "On ") && i+1 < len(lines) {
+		// Multi-line variant: attribution split across 2-3 lines (Gmail soft-wraps
+		// long display names). We try joining up to two trailing lines whenever
+		// the current line starts with any known locale prefix.
+		if hasGmailAttributionPrefix(ll) && i+1 < len(lines) {
 			joined := ll
 			for j := 1; j <= 2 && i+j < len(lines); j++ {
 				joined += " " + strings.TrimSpace(lines[i+j])
-				if gmailAttrRE.MatchString(joined) {
+				if matchesGmailAttribution(joined) {
 					cut = i
 					break
 				}
@@ -115,19 +117,137 @@ func StripQuotedReply(text string) string {
 	return out
 }
 
-// gmailAttrRE matches Gmail / Apple Mail / Thunderbird attribution lines such as:
+// gmailAttrRegexes matches Gmail / Apple Mail / Thunderbird attribution lines
+// across the locales Google ships by default. Examples:
 //
-//	On Mon, May 19, 2026 at 10:30 AM John Doe <john@example.com> wrote:
-//	On 2026-05-19 10:30, John Doe wrote:
-//	On May 19, 2026, at 10:30, John Doe <john@example.com> wrote:
+//	English:    On Mon, May 19, 2026 at 10:30 AM John Doe <john@example.com> wrote:
+//	French:     Le mar. 19 mai 2026, à 09 h 19, Antoine Weill-Duflos <antoine@…> a écrit :
+//	German:     Am Mo., 19. Mai 2026 um 10:30 schrieb John Doe <john@example.com>:
+//	Spanish:    El lun, 19 may 2026 a las 10:30, John Doe <john@example.com> escribió:
+//	Italian:    Il lun 19 mag 2026, 10:30 John Doe <john@example.com> ha scritto:
+//	Portuguese: Em seg., 19 de mai. de 2026 às 10:30, John Doe <john@…> escreveu:
+//	Dutch:      Op ma 19 mei 2026 om 10:30 schreef John Doe <john@example.com>:
 //
-// We accept anything between `On ` and ` wrote:` (case-sensitive for the
-// keywords; the date content varies wildly by locale).
-var gmailAttrRE = regexp.MustCompile(`^On .{3,300}\bwrote:\s*$`)
+// Each pattern is anchored — the line must start with the locale-specific
+// connective ("On ", "Le ", "Am ", "El ", "Il ", "Em ", "Op ") and end with
+// the locale-specific verb plus a colon (French uses a space before the
+// colon per typographic convention, so `\s*:` is lenient).
+var gmailAttrRegexes = []*regexp.Regexp{
+	regexp.MustCompile(`^On .{3,400} wrote\s*:\s*$`),
+	regexp.MustCompile(`^Le .{3,400} a écrit\s*:\s*$`),
+	regexp.MustCompile(`^Am .{3,400} schrieb .{1,200}\s*:\s*$`),
+	regexp.MustCompile(`^El .{3,400} escribió\s*:\s*$`),
+	regexp.MustCompile(`^Il .{3,400} ha scritto\s*:\s*$`),
+	regexp.MustCompile(`^Em .{3,400} escreveu\s*:\s*$`),
+	regexp.MustCompile(`^Op .{3,400} schreef .{1,200}\s*:\s*$`),
+}
+
+// gmailAttrPrefixes lists the leading connectives we consider for the
+// multi-line soft-wrap path. Keep this in sync with gmailAttrRegexes.
+var gmailAttrPrefixes = []string{"On ", "Le ", "Am ", "El ", "Il ", "Em ", "Op "}
+
+func matchesGmailAttribution(s string) bool {
+	for _, re := range gmailAttrRegexes {
+		if re.MatchString(s) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasGmailAttributionPrefix(s string) bool {
+	for _, p := range gmailAttrPrefixes {
+		if strings.HasPrefix(s, p) {
+			return true
+		}
+	}
+	return false
+}
 
 // outlookDividerRE matches the long underscore divider Outlook injects above
 // quoted blocks (12+ underscores on their own line).
 var outlookDividerRE = regexp.MustCompile(`^_{12,}$`)
+
+// htmlQuoteMarkers lists case-insensitive substrings (already lower-cased) that
+// open the quoted-history block in the HTML half of a reply. The first such
+// marker found in the body is the cut point — everything from there to EOF is
+// dropped. Markers cover Gmail, Apple Mail, and Outlook's web and desktop
+// quote layouts.
+var htmlQuoteMarkers = []string{
+	`<div class="gmail_quote`,                            // Gmail (with optional gmail_quote_container suffix)
+	`<blockquote class="gmail_quote`,                     // Gmail standalone blockquote variant
+	`<blockquote type="cite"`,                            // Apple Mail
+	`<div id="appendonsend"`,                             // Outlook web (above the quote)
+	`<div id="mail-editor-reference-message-container"`, // New Outlook
+	`<hr id="stopspelling"`,                              // Outlook quirk divider
+	`<div style="border:none;border-top:solid`,           // Outlook desktop header block above quoted message
+	`<div style="border-top:solid`,                       // Same, alternative spacing
+}
+
+// StripQuotedReplyHTML removes the quoted history from the HTML body of a
+// reply, returning only the new content the sender wrote above the
+// quote-fold. Mirrors StripQuotedReply for the plain-text body so Matrix
+// rooms don't render the whole thread chain twice (once per inbound message).
+//
+// We cut at the first occurrence of a known quote-container marker. Trailing
+// `<br>` runs immediately preceding the cut are trimmed so the visible reply
+// doesn't end on a hanging blank line. We do NOT attempt to balance unclosed
+// tags — Matrix clients run the HTML through a sanitizer that handles
+// truncated fragments gracefully, and the alternative (full DOM parse + walk)
+// is significantly more code for marginal gain.
+//
+// If no marker is found, the input is returned unchanged.
+func StripQuotedReplyHTML(htmlBody string) string {
+	if htmlBody == "" {
+		return ""
+	}
+	lower := strings.ToLower(htmlBody)
+	cut := len(htmlBody)
+	for _, m := range htmlQuoteMarkers {
+		if idx := strings.Index(lower, m); idx >= 0 && idx < cut {
+			cut = idx
+		}
+	}
+	if cut == len(htmlBody) {
+		return htmlBody
+	}
+	out := htmlBody[:cut]
+	// Strip trailing whitespace and any run of <br> tags (with attribute /
+	// self-closing variants) so the new reply body doesn't end on Gmail's
+	// "blank line between body and quote" filler.
+	out = strings.TrimRight(out, " \t\r\n")
+	for {
+		trimmed := trimTrailingBR(out)
+		if trimmed == out {
+			break
+		}
+		out = strings.TrimRight(trimmed, " \t\r\n")
+	}
+	return out
+}
+
+// trimTrailingBR removes a single trailing <br>, <br/>, or <br ...> token
+// (case-insensitive) from the end of s if present.
+func trimTrailingBR(s string) string {
+	if s == "" {
+		return s
+	}
+	if s[len(s)-1] != '>' {
+		return s
+	}
+	// Search backwards for the matching '<'. Stop at the closest one.
+	lt := strings.LastIndexByte(s, '<')
+	if lt < 0 {
+		return s
+	}
+	tag := strings.ToLower(strings.TrimSpace(s[lt+1 : len(s)-1]))
+	tag = strings.TrimSuffix(tag, "/")
+	tag = strings.TrimSpace(tag)
+	if tag == "br" || strings.HasPrefix(tag, "br ") {
+		return s[:lt]
+	}
+	return s
+}
 
 // FormatGmailQuoteText returns a Gmail-style plain-text quote block to be
 // appended to a reply body. Layout:

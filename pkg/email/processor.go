@@ -1188,10 +1188,19 @@ func (e *EmailMatrixEvent) ConvertMessage(ctx context.Context, portal *bridgev2.
 	// referenced via In-Reply-To or References), strip the quoted history so
 	// Matrix readers see only the new content the sender wrote — the quote
 	// chain is preserved in the email itself for downstream mail clients.
+	isReply := e.emailMessage.InReplyTo != "" || len(e.emailMessage.References) > 0
 	bodyText := e.emailMessage.TextContent
-	if e.emailMessage.InReplyTo != "" || len(e.emailMessage.References) > 0 {
+	if isReply {
 		if stripped := StripQuotedReply(bodyText); stripped != "" {
 			bodyText = stripped
+		}
+	}
+	// Matrix renders FormattedBody (HTML) when present, so the same strip has
+	// to happen on the HTML half — otherwise the gmail_quote / blockquote
+	// chain shows up in the room even though we cleaned up the plain text.
+	if isReply && origHTML != "" {
+		if stripped := StripQuotedReplyHTML(origHTML); stripped != "" {
+			origHTML = stripped
 		}
 	}
 	// Avoid duplicating large content when HTML is present: summarize body
