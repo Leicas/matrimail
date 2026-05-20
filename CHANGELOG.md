@@ -1,3 +1,10 @@
+## [1.9.0](https://github.com/Leicas/matrimail/compare/v1.8.0...v1.9.0) (2026-05-20)
+
+
+### Features
+
+* **email:** strip quoted history, Gmail-style replies, marketing-HTML attach, sidecar dedup ([2372e6d](https://github.com/Leicas/matrimail/commit/2372e6dabc190be736eda6e56047b5d17ceec26f))
+
 ## [1.8.0](https://github.com/Leicas/matrimail/compare/v1.7.0...v1.8.0) (2026-05-13)
 
 
