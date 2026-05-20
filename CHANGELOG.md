@@ -1,3 +1,10 @@
+## [1.9.1](https://github.com/Leicas/matrimail/compare/v1.9.0...v1.9.1) (2026-05-20)
+
+
+### Bug Fixes
+
+* **email:** apply Re:/quote on thread-tail replies; strip i18n + HTML quotes inbound ([85db579](https://github.com/Leicas/matrimail/commit/85db57965760fdcbdb71ddd8a6a4f53f784387ff))
+
 ## [1.9.0](https://github.com/Leicas/matrimail/compare/v1.8.0...v1.9.0) (2026-05-20)
 
 
