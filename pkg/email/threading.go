@@ -67,9 +67,29 @@ type EmailThread struct {
 	// LastCc is the Cc header of the most recent inbound.
 	LastCc []string
 
+	// LastDate is the Date header of the most recent inbound. Drives the
+	// Gmail-style "On <date>, <sender> wrote:" attribution line on the next
+	// outbound reply.
+	LastDate time.Time
+	// LastTextBody is the unstripped text/plain body of the most recent
+	// inbound, capped at MaxQuoteBodyBytes. Used to build Gmail-style
+	// quoted-reply blocks. Stored full (with the parent's own quote chain
+	// included) because Gmail only emits one quote level at the producer
+	// side; the chain accumulates through repeated replies.
+	LastTextBody string
+	// LastHTMLBody is the unstripped text/html body of the most recent
+	// inbound, capped at MaxQuoteBodyBytes. Used to build the HTML half of
+	// a Gmail-style quote.
+	LastHTMLBody string
+
 	// Cache management
 	LastAccessed time.Time // For TTL cleanup
 }
+
+// MaxQuoteBodyBytes caps the size of LastTextBody / LastHTMLBody retained in
+// the thread for reply-quoting. Long marketing emails and forwarded chains
+// can be megabytes; we truncate to keep PortalMetadata JSON manageable.
+const MaxQuoteBodyBytes = 64 * 1024
 
 // ClearParticipantChanges clears the participant change tracking after processing
 func (thread *EmailThread) ClearParticipantChanges() {
@@ -442,8 +462,24 @@ func (tm *ThreadManager) addToExistingThread(thread *EmailThread, email *ParsedE
 	if email.Cc != nil {
 		thread.LastCc = append([]string(nil), email.Cc...)
 	}
+	if !email.Date.IsZero() {
+		thread.LastDate = email.Date
+	}
+	thread.LastTextBody = capBody(email.TextContent)
+	thread.LastHTMLBody = capBody(email.HTMLContent)
 
 	return thread
+}
+
+// capBody truncates a body string to MaxQuoteBodyBytes for retention in the
+// thread cache. The result is byte-bounded; we don't try to preserve UTF-8
+// boundaries here because the only consumer (quote-block builder) is robust
+// to trailing partial runes (Go's string ops won't crash).
+func capBody(s string) string {
+	if len(s) <= MaxQuoteBodyBytes {
+		return s
+	}
+	return s[:MaxQuoteBodyBytes]
 }
 
 // createNewThread creates a new email thread
@@ -489,6 +525,9 @@ func (tm *ThreadManager) createNewThread(email *ParsedEmail) *EmailThread {
 		LastFrom:        email.From,
 		LastTo:          append([]string(nil), email.To...),
 		LastCc:          append([]string(nil), email.Cc...),
+		LastDate:        email.Date,
+		LastTextBody:    capBody(email.TextContent),
+		LastHTMLBody:    capBody(email.HTMLContent),
 		LastAccessed:    time.Now(),
 	}
 

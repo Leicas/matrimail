@@ -1143,6 +1143,40 @@ func (e *EmailMatrixEvent) ConvertMessage(ctx context.Context, portal *bridgev2.
 
 		// After removing <img> tags, still rewrite CSS backgrounds referencing cid:
 		rewritten := rewriteHTMLInline(origHTML, cidToMXC, locToMXC)
+
+		// Materialize CSS / Outlook background images as inline <img> tags
+		// so they survive Matrix's HTML sanitizer (which strips `style` and
+		// the legacy `background` attribute). Uploads any cid that was only
+		// referenced via a background and isn't already in cidToMXC.
+		uploadBG := func(cid string) (string, string) {
+			idx := findAttachmentByCID(e.emailMessage.Attachments, cid)
+			if idx < 0 {
+				return "", ""
+			}
+			att := e.emailMessage.Attachments[idx]
+			if e.processor.MaxUploadBytes > 0 && att.Size > int64(e.processor.MaxUploadBytes) {
+				return "", ""
+			}
+			mxc, _, err := intent.UploadMedia(ctx, "", att.Data, bestFilename(att, cid), att.ContentType)
+			if err != nil {
+				e.processor.log.Warn().Err(err).Str("cid", cid).Msg("Failed to upload cid background image")
+				return "", ""
+			}
+			usedInline[idx] = true
+			// Record so the inline-images sidecar path can see it; the meta
+			// label is generic since the only reference was a background.
+			inlineImages = append(inlineImages, &InlineImageMeta{
+				Index: nextIndex,
+				Label: bestFilename(att, cid),
+				MXC:   mxc,
+				Mime:  att.ContentType,
+				Size:  int(att.Size),
+			})
+			nextIndex++
+			return string(mxc), att.ContentType
+		}
+		rewritten = MaterializeBackgroundImages(rewritten, cidToMXC, uploadBG)
+
 		e.processor.log.Debug().
 			Int("inline_images", len(inlineImages)).
 			Int("new_html_len", len(rewritten)).
@@ -1150,8 +1184,16 @@ func (e *EmailMatrixEvent) ConvertMessage(ctx context.Context, portal *bridgev2.
 		origHTML = rewritten
 	}
 
-	// Create the main text message content
+	// Create the main text message content. For replies (parent message
+	// referenced via In-Reply-To or References), strip the quoted history so
+	// Matrix readers see only the new content the sender wrote — the quote
+	// chain is preserved in the email itself for downstream mail clients.
 	bodyText := e.emailMessage.TextContent
+	if e.emailMessage.InReplyTo != "" || len(e.emailMessage.References) > 0 {
+		if stripped := StripQuotedReply(bodyText); stripped != "" {
+			bodyText = stripped
+		}
+	}
 	// Avoid duplicating large content when HTML is present: summarize body
 	if origHTML != "" && len(bodyText) > 2048 {
 		short, _ := truncateUTF8PreserveWords(bodyText, 1000)
@@ -1193,20 +1235,47 @@ func (e *EmailMatrixEvent) ConvertMessage(ctx context.Context, portal *bridgev2.
 		content.Body = "[No text content]"
 	}
 
+	// htmlAttachedAsFile tracks whether the original HTML ends up uploaded as
+	// a sidecar file (because it was either too large to ship as
+	// formatted_body or detected as marketing-heavy and intentionally
+	// dropped). When true, inline images are already visible in that
+	// attachment — emitting m.image sidecars too would produce duplicate
+	// (and often broken) image events.
+	htmlAttachedAsFile := false
+
+	// Marketing-heavy emails (Miro/Mailchimp/etc. style: nested tables,
+	// CSS background images, little real text) render in Matrix as walls
+	// of empty bordered boxes because the sanitizer strips the inline
+	// styles that hold the layout together. Drop the HTML alternative
+	// entirely and force the attach-as-file branch below — the user gets
+	// the readable plain text in Matrix and the full HTML as a clickable
+	// attachment.
+	forceHTMLAttach := origHTML != "" && content.FormattedBody != "" && IsLikelyMarketingHTML(origHTML, bodyText)
+
 	// Step 1: If we have HTML, try to keep it by minifying when necessary
-	if !withinMatrixLimit(content, MaxMatrixContentSize) && content.FormattedBody != "" {
-		// Try bounded minification (more conservative target to account for encryption overhead)
-		if minified, ok := boundedMinifyHTML(content.FormattedBody, HTMLMinificationTarget); ok {
-			content.FormattedBody = minified
+	if (forceHTMLAttach || !withinMatrixLimit(content, MaxMatrixContentSize)) && content.FormattedBody != "" {
+		// Marketing-heavy emails: skip minification (it's not a size problem)
+		// and go straight to attaching the original HTML as a file.
+		if !forceHTMLAttach {
+			// Try bounded minification (more conservative target to account for encryption overhead)
+			if minified, ok := boundedMinifyHTML(content.FormattedBody, HTMLMinificationTarget); ok {
+				content.FormattedBody = minified
+			}
 		}
-			// If still too big, drop HTML but preserve as attachment
-			if !withinMatrixLimit(content, MaxMatrixContentSize) {
+			// Drop HTML and ship the original as a file when forced (marketing)
+			// or when we couldn't get under the size limit even after minify.
+			if forceHTMLAttach || !withinMatrixLimit(content, MaxMatrixContentSize) {
 				content.FormattedBody = ""
-				// Add a small notice in the body.
+				// Add a small notice in the body — wording matches the reason
+				// we dropped the HTML so users know what to expect.
+				notice := "[Full HTML too large to send inline — attached below]"
+				if forceHTMLAttach {
+					notice = "[Marketing-style HTML kept as attachment — open it to see the full design]"
+				}
 				if content.Body != "" {
-					content.Body += "\n\n[Full HTML too large to send inline — attached below]"
+					content.Body += "\n\n" + notice
 				} else {
-					content.Body = "[Full HTML too large to send inline — attached below]"
+					content.Body = notice
 				}
 				htmlBytes := []byte(origHTML)
 				// Prepare a user-facing notice about data handling
@@ -1243,6 +1312,7 @@ func (e *EmailMatrixEvent) ConvertMessage(ctx context.Context, portal *bridgev2.
 						att := &event.MessageEventContent{MsgType: event.MsgFile, Body: filename, URL: mxc}
 						att.Info = &event.FileInfo{MimeType: mimeType, Size: len(htmlBytes)}
 						appendPart("html-attachment", att)
+						htmlAttachedAsFile = true
 					}
 				}
 			}
@@ -1363,9 +1433,18 @@ parts = append(parts, &bridgev2.ConvertedMessagePart{ID: networkid.PartID(pid), 
 	// sidecar m.image event on top creates a duplicate "image card" below
 	// the body. Keeping the sidecar as a fallback means HTML-stripped events
 	// and plain-text-only Matrix clients still see the image.
-	emitSidecars := content.FormattedBody == ""
+	// Emit sidecars only when the formatted_body is gone AND the HTML wasn't
+	// attached as a file (which already contains the inline images). Even
+	// then, skip "decorative" images — tracking pixels, signature logos, and
+	// other small assets that produce broken-image cards more often than they
+	// add value. Real photos and screenshots tend to be well above the
+	// decorative threshold.
+	emitSidecars := content.FormattedBody == "" && !htmlAttachedAsFile
 	if emitSidecars {
 		for _, im := range inlineImages {
+			if isLikelyDecorativeImage(im) {
+				continue
+			}
 			pid := fmt.Sprintf("inline-image-%d", im.Index)
 			imgContent := &event.MessageEventContent{
 				MsgType: event.MsgImage,

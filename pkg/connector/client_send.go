@@ -222,6 +222,9 @@ func (ec *EmailClient) handleMatrixMessageOutbound(ctx context.Context, msg *bri
 		LastTo:          append([]string(nil), thread.LastTo...),
 		LastCc:          append([]string(nil), thread.LastCc...),
 		LastDeliveredTo: thread.LastDeliveredTo,
+		LastDate:        thread.LastDate,
+		LastTextBody:    thread.LastTextBody,
+		LastHTMLBody:    thread.LastHTMLBody,
 	}
 	msg.Portal.Metadata = pm
 	if err := msg.Portal.Save(ctx); err != nil {
@@ -311,6 +314,9 @@ func (ec *EmailClient) resolveThreadForPortalWithMetadata(portal *bridgev2.Porta
 		LastTo:          append([]string(nil), pm.LastTo...),
 		LastCc:          append([]string(nil), pm.LastCc...),
 		LastDeliveredTo: pm.LastDeliveredTo,
+		LastDate:        pm.LastDate,
+		LastTextBody:    pm.LastTextBody,
+		LastHTMLBody:    pm.LastHTMLBody,
 	}
 	ec.Main.ThreadManager.CacheForReceiver(string(ec.UserLogin.ID), thread)
 	return thread, nil
@@ -472,15 +478,46 @@ func buildOutgoingMessage(fromAddr, fromName string, thread *email.EmailThread, 
 	}
 	newMsgID := strings.Trim(email.GenerateMessageID(domain), "<>")
 
+	// Subject: normalize to a single "Re: " prefix on replies (no "Re: Re: …"
+	// chains), and leave a first-send subject untouched. NormalizeReplySubject
+	// strips every leading Re:/RE:/re:/Re[N]: and prepends exactly one "Re: ".
 	subject := thread.Subject
-	if msg.ReplyTo != nil && !strings.HasPrefix(strings.ToLower(strings.TrimSpace(subject)), "re:") {
-		subject = "Re: " + subject
+	if msg.ReplyTo != nil {
+		subject = email.NormalizeReplySubject(subject)
 	}
 
 	textBody := msg.Content.Body
 	htmlBody := ""
 	if msg.Content.Format == event.FormatHTML {
 		htmlBody = msg.Content.FormattedBody
+	}
+
+	// Gmail-style quote: when this is a reply and we know the parent's body,
+	// append "On <date>, <sender> wrote:" followed by a `>`-quoted parent body
+	// (text), and a <div class="gmail_quote"> block (HTML). The parent body is
+	// captured on the inbound path in EmailThread.LastTextBody / LastHTMLBody.
+	if msg.ReplyTo != nil && (thread.LastTextBody != "" || thread.LastHTMLBody != "") {
+		quoteText := email.FormatGmailQuoteText(thread.LastDate, thread.LastFrom, thread.LastTextBody)
+		if quoteText != "" {
+			if textBody != "" {
+				textBody = textBody + "\n\n" + quoteText
+			} else {
+				textBody = quoteText
+			}
+		}
+		if thread.LastHTMLBody != "" {
+			quoteHTML := email.FormatGmailQuoteHTML(thread.LastDate, thread.LastFrom, thread.LastHTMLBody)
+			if quoteHTML != "" {
+				if htmlBody != "" {
+					htmlBody = `<div dir="ltr">` + htmlBody + `</div><br>` + quoteHTML
+				} else {
+					// No HTML alternative from Matrix side, but the parent had
+					// HTML — promote the plain reply body to HTML so the
+					// recipient's client renders the gmail_quote properly.
+					htmlBody = `<div dir="ltr">` + htmlEscapeOutbound(msg.Content.Body) + `</div><br>` + quoteHTML
+				}
+			}
+		}
 	}
 
 	return &email.OutgoingMessage{
@@ -495,6 +532,21 @@ func buildOutgoingMessage(fromAddr, fromName string, thread *email.EmailThread, 
 		TextBody:   textBody,
 		HTMLBody:   htmlBody,
 	}
+}
+
+// htmlEscapeOutbound escapes the user's plain-text reply body before
+// embedding it in the HTML half of a Gmail-quote wrapper. We only escape the
+// four HTML metacharacters and convert newlines to <br>; anything richer
+// would have arrived via Matrix's FormatHTML path already.
+func htmlEscapeOutbound(s string) string {
+	r := strings.NewReplacer(
+		"&", "&amp;",
+		"<", "&lt;",
+		">", "&gt;",
+		`"`, "&quot;",
+		"\n", "<br>",
+	)
+	return r.Replace(s)
 }
 
 // downloadMediaAsAttachment pulls a Matrix media payload (encrypted or not)

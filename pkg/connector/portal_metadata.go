@@ -12,6 +12,8 @@
 // migrating older rows.
 package connector
 
+import "time"
+
 // PortalMetadata mirrors the parts of email.EmailThread that are useful to
 // reconstruct a thread from cold storage. Kept narrow on purpose: the
 // participant-delta fields (Added/Removed) are runtime-only churn from inbound
@@ -62,4 +64,15 @@ type PortalMetadata struct {
 	// LastDeliveredTo is the alias the most recent inbound was addressed to;
 	// replies use this as From.
 	LastDeliveredTo string `json:"last_delivered_to,omitempty"`
+
+	// LastDate is the Date header of the most recent inbound, used by the
+	// Gmail-style quote builder for the attribution line.
+	LastDate time.Time `json:"last_date,omitempty"`
+	// LastTextBody is the plain-text body of the most recent inbound, capped
+	// at email.MaxQuoteBodyBytes. Persisted so post-restart outbound replies
+	// can still produce a quote block; without it the reply ships unquoted.
+	LastTextBody string `json:"last_text_body,omitempty"`
+	// LastHTMLBody is the html body of the most recent inbound, capped at
+	// email.MaxQuoteBodyBytes.
+	LastHTMLBody string `json:"last_html_body,omitempty"`
 }
