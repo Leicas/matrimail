@@ -10,6 +10,7 @@ import (
 	"github.com/rs/zerolog"
 	"golang.org/x/oauth2"
 	gmail "google.golang.org/api/gmail/v1"
+	"google.golang.org/api/googleapi"
 	"google.golang.org/api/option"
 )
 
@@ -45,9 +46,12 @@ func (g *GmailAPISender) Close() error { return nil }
 // IMAP IDLE pickup).
 //
 // When threadID is non-empty it is set as gmail.Message.ThreadId so Gmail files
-// the reply inside the existing conversation. Gmail validates that the message's
-// References/In-Reply-To and Subject are consistent with that thread; the
-// outbound builder already sets those, so a mismatch should not occur.
+// the reply inside the existing conversation. The ThreadId is only a best-effort
+// grouping hint: a stale or cross-mailbox ID (re-auth, the thread moved/deleted
+// server-side, an ID learned under a different account) makes Gmail reject the
+// whole send with 404 notFound. We MUST NOT let that block delivery — on such a
+// rejection we resend once without the ThreadId, trading conversation grouping
+// in the sender's mailbox for a message that actually goes out.
 func (g *GmailAPISender) Send(ctx context.Context, mimeBytes []byte, from string, to []string, threadID string) (string, error) {
 	_ = from // userId="me" implies the authenticated user; from header inside the MIME is what Gmail uses
 	if len(to) == 0 {
@@ -72,6 +76,17 @@ func (g *GmailAPISender) Send(ctx context.Context, mimeBytes []byte, from string
 	}
 
 	sent, err := svc.Users.Messages.Send("me", outMsg).Context(ctx).Do()
+	if err != nil && threadID != "" && isGmailBadThreadErr(err) {
+		// The ThreadId didn't resolve in this mailbox. Drop it and retry so the
+		// message still sends (it just won't group under the original
+		// conversation in the sender's Sent view).
+		if g.log != nil {
+			g.log.Warn().Err(err).Str("gmail_thread_id", threadID).
+				Msg("Gmail rejected ThreadId; resending without thread grouping")
+		}
+		outMsg.ThreadId = ""
+		sent, err = svc.Users.Messages.Send("me", outMsg).Context(ctx).Do()
+	}
 	if err != nil {
 		return "", fmt.Errorf("gmail send: %w", err)
 	}
@@ -101,4 +116,20 @@ func (g *GmailAPISender) Send(ctx context.Context, mimeBytes []byte, from string
 		}
 	}
 	return "", nil
+}
+
+// isGmailBadThreadErr reports whether err is a Gmail API rejection attributable
+// to an unusable ThreadId. Gmail returns 404 notFound when the thread doesn't
+// exist in the mailbox, and 400 for a malformed / cross-mailbox thread
+// reference; we only treat a 400 as thread-related when the message mentions
+// "thread" so genuine 400s (bad recipient, oversized message) still surface.
+func isGmailBadThreadErr(err error) bool {
+	var gerr *googleapi.Error
+	if !errors.As(err, &gerr) {
+		return false
+	}
+	if gerr.Code == 404 {
+		return true
+	}
+	return gerr.Code == 400 && strings.Contains(strings.ToLower(gerr.Message), "thread")
 }
