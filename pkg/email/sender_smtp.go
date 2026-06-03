@@ -47,7 +47,10 @@ func (s *SMTPSender) Close() error { return nil }
 // Send delivers mimeBytes to the SMTP submission endpoint. SMTP does not echo
 // back a server-assigned Message-ID, so the returned messageID is always "" —
 // callers must read the Message-ID they wrote into the MIME headers instead.
-func (s *SMTPSender) Send(ctx context.Context, mimeBytes []byte, from string, to []string) (string, error) {
+//
+// threadID is ignored: SMTP threading is governed entirely by the RFC
+// In-Reply-To/References headers the MIME builder already wrote.
+func (s *SMTPSender) Send(ctx context.Context, mimeBytes []byte, from string, to []string, _ string) (string, error) {
 	if len(to) == 0 {
 		return "", errors.New("smtp: no recipients")
 	}

@@ -17,6 +17,6 @@ func (s *GraphSender) Provider() string { return "ms-graph" }
 func (s *GraphSender) Close() error { return nil }
 
 // Send always returns an error indicating the v1 fallback path.
-func (s *GraphSender) Send(_ context.Context, _ []byte, _ string, _ []string) (string, error) {
+func (s *GraphSender) Send(_ context.Context, _ []byte, _ string, _ []string, _ string) (string, error) {
 	return "", errors.New("ms-graph sender not implemented in v1; SMTP fallback is used for outlook.com / hotmail.com / live.com / office365.com")
 }

@@ -12,7 +12,7 @@ import (
 // EmailClient.Sender to a non-nil value.
 type noopSender struct{}
 
-func (noopSender) Send(ctx context.Context, mimeBytes []byte, from string, to []string) (string, error) {
+func (noopSender) Send(ctx context.Context, mimeBytes []byte, from string, to []string, threadID string) (string, error) {
 	return "", nil
 }
 func (noopSender) Provider() string { return "noop" }

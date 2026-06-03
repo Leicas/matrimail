@@ -159,7 +159,10 @@ func (ec *EmailClient) handleMatrixMessageOutbound(ctx context.Context, msg *bri
 		recipientStrs = append(recipientStrs, a.Address)
 	}
 
-	serverID, err := ec.Sender.Send(ctx, mimeBytes, fromAddr, recipientStrs)
+	// Pass the Gmail-native thread ID (empty for non-Gmail / IMAP-learned
+	// threads) so the Gmail API files the reply inside the original
+	// conversation in the sender's mailbox instead of starting a new one.
+	serverID, err := ec.Sender.Send(ctx, mimeBytes, fromAddr, recipientStrs, thread.GmailThreadID)
 	if err != nil {
 		_ = postErrorToPortal(ctx, ec.UserLogin.Bridge, msg.Portal, "Send failed", err.Error())
 		return nil, fmt.Errorf("send: %w", err)

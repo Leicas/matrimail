@@ -43,7 +43,12 @@ func (g *GmailAPISender) Close() error { return nil }
 // a warn-level log; the caller is expected to fall back to the Message-ID it
 // wrote into the MIME headers (which means a small risk of double-posting on
 // IMAP IDLE pickup).
-func (g *GmailAPISender) Send(ctx context.Context, mimeBytes []byte, from string, to []string) (string, error) {
+//
+// When threadID is non-empty it is set as gmail.Message.ThreadId so Gmail files
+// the reply inside the existing conversation. Gmail validates that the message's
+// References/In-Reply-To and Subject are consistent with that thread; the
+// outbound builder already sets those, so a mismatch should not occur.
+func (g *GmailAPISender) Send(ctx context.Context, mimeBytes []byte, from string, to []string, threadID string) (string, error) {
 	_ = from // userId="me" implies the authenticated user; from header inside the MIME is what Gmail uses
 	if len(to) == 0 {
 		return "", errors.New("gmail: no recipients")
@@ -61,7 +66,12 @@ func (g *GmailAPISender) Send(ctx context.Context, mimeBytes []byte, from string
 	// without padding is what the API documentation specifies.
 	raw := base64.URLEncoding.WithPadding(base64.NoPadding).EncodeToString(mimeBytes)
 
-	sent, err := svc.Users.Messages.Send("me", &gmail.Message{Raw: raw}).Context(ctx).Do()
+	outMsg := &gmail.Message{Raw: raw}
+	if threadID != "" {
+		outMsg.ThreadId = threadID
+	}
+
+	sent, err := svc.Users.Messages.Send("me", outMsg).Context(ctx).Do()
 	if err != nil {
 		return "", fmt.Errorf("gmail send: %w", err)
 	}
