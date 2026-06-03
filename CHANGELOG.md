@@ -1,3 +1,10 @@
+## [1.9.3](https://github.com/Leicas/matrimail/compare/v1.9.2...v1.9.3) (2026-06-03)
+
+
+### Bug Fixes
+
+* **gmail:** never let a stale ThreadId block sending; resend without it on 404 ([4684f5e](https://github.com/Leicas/matrimail/commit/4684f5e22cccbcbd1dad4695ef7b0d4922a33ba4))
+
 ## [1.9.2](https://github.com/Leicas/matrimail/compare/v1.9.1...v1.9.2) (2026-06-03)
 
 
