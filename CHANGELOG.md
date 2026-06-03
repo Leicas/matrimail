@@ -1,3 +1,10 @@
+## [1.9.2](https://github.com/Leicas/matrimail/compare/v1.9.1...v1.9.2) (2026-06-03)
+
+
+### Bug Fixes
+
+* **gmail:** echo thread ID on Gmail API sends so replies thread in sender mailbox ([1828286](https://github.com/Leicas/matrimail/commit/1828286cca8074929cbbfe8839cbfbf9d17c0377))
+
 ## [1.9.1](https://github.com/Leicas/matrimail/compare/v1.9.0...v1.9.1) (2026-05-20)
 
 
